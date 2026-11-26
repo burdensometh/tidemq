@@ -1,5 +1,8 @@
 package tidemq;
 
+import tidemq.deadletter.DeadLetterReceipt;
+import tidemq.deadletter.DeadLetters;
+import tidemq.segment.RecordFile;
 import tidemq.wire.TcpBroker;
 import tidemq.wire.TideClient;
 
@@ -13,6 +16,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
@@ -87,6 +91,17 @@ final class TestSupport {
                 }
             }
         }
+    }
+
+    /** Creates an uninitialized directory holding only a v1 dead-letter journal. */
+    static Path legacyDeadLetterJournal(Path parent, List<DeadLetterReceipt> receipts) throws IOException {
+        Path directory = Files.createDirectory(parent.resolve("legacy"));
+        var file = RecordFile.create(directory.resolve(DeadLetters.V1_FILE),
+                new RecordFile.Header(0x544D444C, 0, 1_700_000_000_000L));
+        for (DeadLetterReceipt receipt : receipts) {
+            file.append(Binary.encode(out -> DeadLetters.write(out, receipt)), () -> {});
+        }
+        return directory;
     }
 
     static final class Time extends Clock {

@@ -13,6 +13,7 @@ public interface Boundary {
         GROUP_BEFORE_REPLACE,
         GROUP_AFTER_REPLACE,
         DEADLETTER_BEFORE_FORCE,
+        DEADLETTER_AFTER_PAYLOAD_FORCE,
         DEADLETTER_AFTER_FORCE
     }
 

@@ -1,7 +1,10 @@
 package tidemq;
 
+import tidemq.deadletter.DeadLetterReceipt;
+import tidemq.deadletter.DeadLetters;
 import tidemq.delivery.DeliveryLease;
 import tidemq.ingress.Ingress;
+import tidemq.segment.Message;
 import tidemq.segment.Segment;
 import tidemq.segment.TopicPartition;
 import tidemq.wire.TcpBroker;
@@ -46,6 +49,14 @@ public final class BrokerTest {
                 new Case("lease-timeout-retries-and-terminal-delivery", BrokerTest::retry),
                 new Case("dead-letter-before-force-reconciled", () -> recoverDeadLetter(Boundary.Point.DEADLETTER_BEFORE_FORCE)),
                 new Case("dead-letter-force-before-frontier-reconciled", () -> recoverDeadLetter(Boundary.Point.DEADLETTER_AFTER_FORCE)),
+                new Case("dead-letter-payload-before-metadata-never-completes", () -> recoverDeadLetter(Boundary.Point.DEADLETTER_AFTER_PAYLOAD_FORCE)),
+                new Case("dead-letter-v1-migrates-losslessly", DeadLettersTests::v1Migration),
+                new Case("dead-letter-migration-resumes-after-interruption", DeadLettersTests::migrationResumes),
+                new Case("dead-letter-metadata-and-payload-are-separate", DeadLettersTests::separateStorage),
+                new Case("dead-letter-migration-preserves-paging-cursor", DeadLettersTests::pagingCursor),
+                new Case("dead-letter-paging-honours-byte-budget", DeadLettersTests::pagingHonoursByteBudget),
+                new Case("dead-letter-archive-is-idempotent-per-source", DeadLettersTests::archiveIsIdempotent),
+                new Case("dead-letter-v1-migrates-through-broker-restart", DeadLettersTests::brokerMigrationEndToEnd),
                 new Case("group-before-replace-preserves-prior-epoch", BrokerTest::abortEpoch),
                 new Case("group-commit-before-epoch-reply-reconciled", BrokerTest::recoverEpoch),
                 new Case("blocked-retention-and-reentry-after-advance", BrokerTest::retention),

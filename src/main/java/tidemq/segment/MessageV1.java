@@ -37,6 +37,10 @@ public final class MessageV1 {
     }
 
     public static int wireBodyBytes(Message message) {
-        return 36 + message.producer().length() + message.keySize() + message.payloadSize();
+        return wireBodyBytes(message.producer().length(), message.keySize(), message.payloadSize());
+    }
+
+    public static int wireBodyBytes(int producerLength, int keyLength, int payloadLength) {
+        return 36 + producerLength + keyLength + payloadLength;
     }
 }

@@ -11,6 +11,11 @@ public record DeadLetterReceipt(long sequence, String group, int attempts, long 
         }
     }
 
+    /** The group partition offset this dead letter terminates. */
+    public DeadLetters.Source source() {
+        return new DeadLetters.Source(group, message.partition(), message.offset());
+    }
+
     public int wireBytes() {
         return 8 + 4 + group.length() + 4 + 8 + 8 + message.partition().topic().length()
                 + tidemq.segment.MessageV1.wireBodyBytes(message);

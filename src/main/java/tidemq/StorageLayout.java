@@ -7,13 +7,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
-import java.util.List;
 
 final class StorageLayout {
     private static final String MARKER = "storage.v1";
     private static final byte[] VERSION = "TideMQ broker storage v1\n".getBytes(StandardCharsets.UTF_8);
-    private static final List<String> REQUIRED_FILES = List.of(
-            "segments/topology.v1", "produce.v1.journal", "deadletter.v1.journal");
 
     private final Path root;
     private final boolean initialized;
@@ -29,13 +26,24 @@ final class StorageLayout {
                 || !Arrays.equals(Files.readAllBytes(marker), VERSION)) {
             throw new IOException("unsupported storage marker: " + marker);
         }
-        for (String file : REQUIRED_FILES) {
-            if (!Files.isRegularFile(root.resolve(file))) {
-                throw new IOException("initialized data directory is missing " + file);
-            }
+        require(root, "segments/topology.v1");
+        require(root, "produce.v1.journal");
+        // The dead-letter store may still be a pre-upgrade v1 journal; the
+        // broker migrates it on open. Either form is a valid initialized layout.
+        boolean legacy = Files.isRegularFile(root.resolve("deadletter.v1.journal"));
+        boolean current = Files.isRegularFile(root.resolve("deadletter.v2.meta"))
+                && Files.isRegularFile(root.resolve("deadletter.v2.data"));
+        if (!legacy && !current) {
+            throw new IOException("initialized data directory is missing dead-letter storage");
         }
         if (!Files.isDirectory(root.resolve("groups"))) {
             throw new IOException("initialized data directory is missing groups/");
+        }
+    }
+
+    private static void require(Path root, String name) throws IOException {
+        if (!Files.isRegularFile(root.resolve(name))) {
+            throw new IOException("initialized data directory is missing " + name);
         }
     }
 
