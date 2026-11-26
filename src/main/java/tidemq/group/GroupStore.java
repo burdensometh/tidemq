@@ -148,12 +148,13 @@ final class GroupStore {
                     throw new IOException("invalid persisted partition in group");
                 }
             }
-            int expected = 0;
+            // Partitions added by an online expansion after this snapshot was
+            // stored start at watermark zero and are adopted on the next save.
             for (String topic : topics) {
-                expected += segments.partitionCount(topic);
-            }
-            if (expected != partitions) {
-                throw new IOException("group snapshot is missing partition frontiers");
+                for (int number = 0; number < segments.partitionCount(topic); number++) {
+                    frontiers.putIfAbsent(new TopicPartition(topic, number),
+                            new AckFrontier(segments.range(new TopicPartition(topic, number)).retainedFrom()));
+                }
             }
             return new GroupState(name, topics, frontiers, epoch);
         });

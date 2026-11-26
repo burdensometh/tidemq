@@ -176,6 +176,13 @@ public final class TideClient implements AutoCloseable {
         return request(Opcode.TOPICS, EMPTY, WireValues::readTopics);
     }
 
+    public SegmentStore.Expansion expand(String topic, int targetPartitions) throws IOException {
+        return request(Opcode.EXPAND, output -> {
+            Binary.writeText(output, topic);
+            output.writeInt(targetPartitions);
+        }, WireValues::readExpansionResponse);
+    }
+
     public SegmentStore.PartitionView partition(TopicPartition partition, int limit) throws IOException {
         return request(Opcode.PARTITION, output -> {
             MessageV1.writePartition(output, partition);

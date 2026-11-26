@@ -78,6 +78,29 @@ public final class GroupState {
         return true;
     }
 
+    /**
+     * Adopts partitions added by an online expansion. Every new partition starts
+     * at watermark zero; existing frontiers are untouched. When the group has
+     * connected members the generation advances and assignments rebalance so the
+     * added partitions become claimable. Offline groups still record the
+     * frontiers durably and rebalance on their next join.
+     */
+    void adoptPartitions(List<TopicPartition> added) throws BrokerException {
+        boolean changed = false;
+        for (TopicPartition partition : added) {
+            if (frontiers.putIfAbsent(partition, new AckFrontier(0)) == null) {
+                changed = true;
+            }
+        }
+        if (!changed) {
+            return;
+        }
+        if (!members.isEmpty()) {
+            advanceEpoch();
+        }
+        rebalance();
+    }
+
     private void advanceEpoch() throws BrokerException {
         if (epoch == Long.MAX_VALUE) {
             throw new BrokerException(BrokerException.Code.CAPACITY, "group epoch exhausted");

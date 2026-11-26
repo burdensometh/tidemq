@@ -34,6 +34,10 @@ final class PartitionLog {
         }
     }
 
+    TopicPartition topicPartition() {
+        return partition;
+    }
+
     private Segment last() {
         return segments.lastEntry().getValue();
     }

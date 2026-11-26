@@ -140,6 +140,21 @@ public final class RecordFile {
         }
     }
 
+    /**
+     * Truncates the file to an earlier record boundary and forces the result.
+     * Used to discard an append whose commit step never completed.
+     */
+    public void truncate(long position) throws IOException {
+        if (position < HEADER_BYTES || position > end) {
+            throw new IOException("truncate position outside the committed record range");
+        }
+        try (FileChannel file = FileChannel.open(path, StandardOpenOption.WRITE)) {
+            file.truncate(position);
+            file.force(true);
+        }
+        end = position;
+    }
+
     public void forEach(Visitor visitor) throws IOException {
         try (FileChannel file = FileChannel.open(path, StandardOpenOption.READ)) {
             scan(file, false, visitor);

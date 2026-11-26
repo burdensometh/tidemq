@@ -10,6 +10,7 @@ import tidemq.wire.GroupConsumer;
 import tidemq.wire.ResumableProducer;
 
 import java.io.EOFException;
+import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.file.Files;
 import java.util.Arrays;
@@ -50,6 +51,15 @@ public final class BrokerTest {
                 new Case("group-commit-before-epoch-reply-reconciled", BrokerTest::recoverEpoch),
                 new Case("blocked-retention-and-reentry-after-advance", BrokerTest::retention),
                 new Case("single-process-lock-and-fixed-routes", BrokerTest::lockAndTopology),
+                new Case("online-expand-routes-and-topics", BrokerTest::onlineExpand),
+                new Case("routing-boundary-survives-restart", BrokerTest::routingBoundaryRestart),
+                new Case("new-partition-gated-until-old-route-caught-up", BrokerTest::consumeBoundary),
+                new Case("expand-idempotent-receipts-and-replays", BrokerTest::expandReceipts),
+                new Case("expand-failure-leaves-committed-boundary", BrokerTest::expandCrash),
+                new Case("expand-abort-before-route-force-rolls-back", BrokerTest::expandAbortBeforeForce),
+                new Case("expand-rebalances-live-and-offline-groups", BrokerTest::expandGroups),
+                new Case("repeated-expansions-keep-each-generation-gate", BrokerTest::repeatedExpansion),
+                new Case("consume-gate-survives-restart", BrokerTest::gateRestart),
                 new Case("legacy-v1-normal-incomplete-and-corrupt", Fixtures::check));
         List<String> filters = Arrays.asList(selected);
         int passed = 0;
@@ -440,6 +450,266 @@ public final class BrokerTest {
             try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
                 eq(Map.of("orders", 1), client.topics());
             }
+        }
+    }
+
+    private static void onlineExpand() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, Map.of("orders", 2), 1000), new Time(), Boundary.NONE);
+             var client = connect(server)) {
+            byte[] moving = bytes("kilo");
+            int oldRoute = Math.floorMod(Arrays.hashCode(moving), 2);
+            var before = client.produce("p", 0, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("first"));
+            eq(new TopicPartition("orders", oldRoute), before.partition());
+            var expansion = client.expand("orders", 4);
+            eq(2, expansion.previousPartitions());
+            eq(4, expansion.partitionCount());
+            eq(List.of(1L, 0L), expansion.boundaries());
+            eq(4, client.topics().get("orders"));
+            int newRoute = Math.floorMod(Arrays.hashCode(moving), 4);
+            var after = client.produce("p", 1, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("second"));
+            eq(new TopicPartition("orders", newRoute), after.partition());
+            check(newRoute != oldRoute, "test key must change partition when expanding 2 -> 4");
+            // Explicit partition addressing still reaches every new partition.
+            for (int partition = 0; partition < 4; partition++) {
+                var receipt = client.produce("explicit", partition, "orders", partition, bytes("k"), bytes("v"));
+                eq(new TopicPartition("orders", partition), receipt.partition());
+            }
+            code(BAD_REQUEST, () -> client.expand("orders", 3));
+            code(UNKNOWN_TOPIC, () -> client.expand("missing", 2));
+        }
+    }
+
+    private static void routingBoundaryRestart() throws Exception {
+        var tmp = new Scratch();
+        var time = new Time();
+        var config = settings(tmp.root, Map.of("orders", 2), 1000);
+        byte[] moving = bytes("kilo");
+        int oldRoute = Math.floorMod(Arrays.hashCode(moving), 2);
+        int newRoute;
+        try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+            client.produce("p", 0, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("first"));
+            client.expand("orders", 4);
+            newRoute = Math.floorMod(Arrays.hashCode(moving), 4);
+            client.produce("p", 1, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("second"));
+            check(newRoute != oldRoute, "test key must change partition");
+        }
+        try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+            eq(4, client.topics().get("orders"));
+            var again = client.produce("p", 2, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("third"));
+            eq(new TopicPartition("orders", newRoute), again.partition());
+            // The old partition stays frozen at its expansion boundary while the
+            // new one keeps accepting messages after the restart.
+            eq(1L, client.partition(new TopicPartition("orders", oldRoute), 1).range().nextOffset());
+            eq(2L, client.partition(new TopicPartition("orders", newRoute), 1).range().nextOffset());
+            check(Files.exists(tmp.root.resolve("route.v1.journal")), "route journal missing after restart");
+        }
+    }
+
+    private static void consumeBoundary() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, Map.of("orders", 2), 1000), new Time(), Boundary.NONE);
+             var client = connect(server)) {
+            byte[] moving = bytes("kilo");
+            int oldRoute = Math.floorMod(Arrays.hashCode(moving), 2);
+            // Three pre-expansion messages land in the key's old partition, so its
+            // boundary is offset 3 and the other old partition stays empty.
+            for (long sequence = 0; sequence < 3; sequence++) {
+                client.produce("p", sequence, "orders", oldRoute,
+                        bytes("key-" + sequence), bytes("old-" + sequence));
+            }
+            client.expand("orders", 4);
+            int newRoute = Math.floorMod(Arrays.hashCode(moving), 4);
+            check(newRoute != oldRoute, "test key must change partition");
+            client.produce("p", 9, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("new-message"));
+            // A group joining after the expansion must not see the new partition
+            // until every pre-expansion partition reaches its boundary.
+            long epoch = client.join("g", "m", ORDERS).number();
+            var first = client.pull(epoch, 1);
+            eq(0L, first.getFirst().lease().message().offset());
+            ack(client, epoch, first);
+            // One message confirmed, boundary 3 not yet reached: the next delivery
+            // is still an old-partition message and the new partition stays gated.
+            var second = client.pull(epoch, 1);
+            eq(1L, second.getFirst().lease().message().offset());
+            eq(new TopicPartition("orders", oldRoute), second.getFirst().lease().message().partition());
+            ack(client, epoch, second);
+            var third = client.pull(epoch, 1);
+            eq(2L, third.getFirst().lease().message().offset());
+            ack(client, epoch, third);
+            // The old route now reaches its boundary; the moved key's message in
+            // the new partition is finally delivered, never before the old ones.
+            var delivered = client.pull(epoch, 1);
+            eq(1, delivered.size());
+            eq(new TopicPartition("orders", newRoute), delivered.getFirst().lease().message().partition());
+            check(Arrays.equals(bytes("new-message"), delivered.getFirst().lease().message().payload()),
+                    "new-partition message payload mismatch");
+            ack(client, epoch, delivered);
+            eq(List.of(), client.pull(epoch, 1));
+        }
+    }
+
+    private static void expandReceipts() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, Map.of("orders", 2), 1000), new Time(), Boundary.NONE);
+             var client = connect(server)) {
+            byte[] moving = bytes("kilo");
+            int oldRoute = Math.floorMod(Arrays.hashCode(moving), 2);
+            var original = client.produce("p", 7, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("kept"));
+            eq(new TopicPartition("orders", oldRoute), original.partition());
+            client.expand("orders", 4);
+            check(Math.floorMod(Arrays.hashCode(moving), 4) != oldRoute, "test key must change partition");
+            // Resending the identical request after the route change returns the
+            // original receipt, flagged as replay, with no new append.
+            var replay = client.produce("p", 7, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("kept"));
+            check(replay.replayed(), "resend must recover the stored receipt");
+            eq(original.partition(), replay.partition());
+            eq(original.offset(), replay.offset());
+            eq(original.appendedAtMs(), replay.appendedAtMs());
+            // A different payload under the same identity is still a conflict.
+            code(PRODUCER_CONFLICT,
+                    () -> client.produce("p", 7, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("changed")));
+        }
+    }
+
+    private static void expandCrash() throws Exception {
+        var tmp = new Scratch();
+        var time = new Time();
+        var config = settings(tmp.root, Map.of("orders", 2), 1000);
+        var fault = new Fault();
+        try (var server = TcpBroker.start(config, time, fault); var client = connect(server)) {
+            client.produce("p", 0, "orders", 0, bytes("k"), bytes("v"));
+            fault.arm(Boundary.Point.ROUTE_AFTER_FORCE);
+            code(STORAGE_FAILURE, () -> client.expand("orders", 3));
+        }
+        try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+            eq(3, client.topics().get("orders"));
+            var receipt = client.produce("p", 1, "orders", 2, bytes("k"), bytes("on-new-partition"));
+            eq(new TopicPartition("orders", 2), receipt.partition());
+            eq(0L, receipt.offset());
+        }
+    }
+
+    private static void expandAbortBeforeForce() throws Exception {
+        var tmp = new Scratch();
+        var time = new Time();
+        var config = settings(tmp.root, Map.of("orders", 2), 1000);
+        var armed = new java.util.concurrent.atomic.AtomicBoolean(false);
+        Boundary boundary = point -> {
+            if (armed.get() && point == Boundary.Point.ROUTE_BEFORE_FORCE) {
+                throw new IOException("route generation not forced");
+            }
+        };
+        try (var server = TcpBroker.start(config, time, boundary); var client = connect(server)) {
+            client.produce("p", 0, "orders", 0, bytes("k"), bytes("v"));
+            armed.set(true);
+            // The fault trips before the new routing generation is forced, so the
+            // journal never commits the expansion and the broker fences itself.
+            code(STORAGE_FAILURE, () -> client.expand("orders", 3));
+        }
+        try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+            eq(2, client.topics().get("orders"));
+            // The uncommitted partition is not routable; the old topology is intact.
+            code(UNKNOWN_TOPIC, () -> client.produce("p", 1, "orders", 2, bytes("k"), bytes("rejected")));
+            var receipt = client.produce("p", 1, "orders", 0, bytes("k"), bytes("still-old"));
+            eq(new TopicPartition("orders", 0), receipt.partition());
+            eq(1L, receipt.offset());
+        }
+    }
+
+    private static void expandGroups() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, Map.of("orders", 2), 1000), new Time(), Boundary.NONE);
+             var live = connect(server); var offline = connect(server)) {
+            long liveEpoch = live.join("live", "a", ORDERS).number();
+            long offlineEpoch = offline.join("resting", "m", ORDERS).number();
+            offline.leave();
+            var expansion = live.expand("orders", 3);
+            eq(3, expansion.partitionCount());
+            long afterEpoch = live.assignment().number();
+            check(afterEpoch > liveEpoch, "connected group must rebalance onto the added partition");
+            eq(List.of(new TopicPartition("orders", 0), new TopicPartition("orders", 1),
+                    new TopicPartition("orders", 2)), live.assignment().assignment());
+            // The offline group keeps its durable watermarks and adopts the new
+            // partition without reusing its prior generation number.
+            var rejoinEpoch = offline.join("resting", "m", ORDERS).number();
+            check(rejoinEpoch > offlineEpoch, "rejoined group must take a fresh generation");
+            var view = offline.group("resting");
+            check(view.frontiers().containsKey(new TopicPartition("orders", 2)), "new partition frontier missing");
+            eq(0L, view.frontiers().get(new TopicPartition("orders", 2)).next());
+        }
+    }
+
+    private static void repeatedExpansion() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, Map.of("orders", 2), 1000), new Time(), Boundary.NONE);
+             var client = connect(server)) {
+            byte[] moving = bytes("kilo"); // mod2=0, mod3=0, mod4=2
+            int routeAt2 = Math.floorMod(Arrays.hashCode(moving), 2);
+            client.produce("p", 0, "orders", routeAt2, bytes("seed"), bytes("gen0"));
+            var first = client.expand("orders", 3);
+            eq(List.of(1L, 0L), first.boundaries());
+            // kilo still routes to partition 0 with three partitions; a new key
+            // exercises the partition added by the first expansion.
+            client.produce("p", 1, "orders", 2, bytes("on-p2"), bytes("gen1"));
+            var second = client.expand("orders", 4);
+            eq(3, second.previousPartitions());
+            eq(List.of(1L, 0L, 1L), second.boundaries());
+            int routeAt4 = Math.floorMod(Arrays.hashCode(moving), 4);
+            check(routeAt4 != routeAt2, "kilo must move on the second expansion");
+            var moved = client.produce("p", 2, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("gen2"));
+            eq(new TopicPartition("orders", routeAt4), moved.partition());
+            // A group must clear both generation gates (boundaries of gen1 and
+            // gen2) before reading either newly introduced partition.
+            long epoch = client.join("g", "m", ORDERS).number();
+            // Partition 0 still owns the only pre-first-expansion message. Every
+            // partition added by either generation stays gated until it is
+            // confirmed, so the first pull exposes just that old-route message.
+            var oldOnly = client.pull(epoch, 2);
+            eq(1, oldOnly.size());
+            eq(new TopicPartition("orders", 0), oldOnly.getFirst().lease().message().partition());
+            ack(client, epoch, oldOnly);
+            // Both generation gates are now open: partition 2 holds its own
+            // first-generation message and the moved key's second-generation one.
+            var rest = client.pull(epoch, 8);
+            eq(2, rest.size());
+            rest.forEach(received -> check(received.lease().message().partition().partition() >= 2,
+                    "all remaining messages must come from partitions added by expansions"));
+            ack(client, epoch, rest);
+            eq(List.of(), client.pull(epoch, 8));
+        }
+    }
+
+    private static void gateRestart() throws Exception {
+        var tmp = new Scratch();
+        var time = new Time();
+        var config = settings(tmp.root, Map.of("orders", 2), 1000);
+        byte[] moving = bytes("kilo");
+        int oldRoute = Math.floorMod(Arrays.hashCode(moving), 2);
+        int newRoute = Math.floorMod(Arrays.hashCode(moving), 4);
+        try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+            for (long sequence = 0; sequence < 2; sequence++) {
+                client.produce("p", sequence, "orders", oldRoute, bytes("k" + sequence), bytes("old"));
+            }
+            client.expand("orders", 4);
+            client.produce("p", 8, "orders", Ingress.ROUTE_BY_KEY, moving, bytes("after-move"));
+            // The group exists but never consumed, so its new-partition gate is
+            // closed when the process restarts.
+            client.join("g", "m", ORDERS);
+            client.leave();
+        }
+        try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+            long epoch = client.join("g", "m", ORDERS).number();
+            var first = client.pull(epoch, 1);
+            eq(new TopicPartition("orders", oldRoute), first.getFirst().lease().message().partition());
+            ack(client, epoch, first);
+            var second = client.pull(epoch, 1);
+            eq(new TopicPartition("orders", oldRoute), second.getFirst().lease().message().partition());
+            // The gate is still closed before the second old message is confirmed.
+            ack(client, epoch, second);
+            var moved = client.pull(epoch, 1);
+            eq(1, moved.size());
+            eq(new TopicPartition("orders", newRoute), moved.getFirst().lease().message().partition());
         }
     }
 

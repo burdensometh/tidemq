@@ -5,7 +5,7 @@ import tidemq.Settings;
 public record TopicPartition(String topic, int partition) implements Comparable<TopicPartition> {
     public TopicPartition {
         Settings.requireIdentifier(topic, "topic");
-        if (partition < 0 || partition >= 64) {
+        if (partition < 0 || partition >= Settings.MAX_PARTITIONS) {
             throw new IllegalArgumentException("invalid partition " + partition);
         }
     }

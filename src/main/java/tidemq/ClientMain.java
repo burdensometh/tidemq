@@ -50,6 +50,7 @@ public final class ClientMain {
                     java -cp build/tidemq.jar tidemq.ClientMain HOST PORT COMMAND
                       ping
                       topics
+                      expand TOPIC PARTITIONS
                       produce PRODUCER SEQUENCE TOPIC PARTITION|- KEY VALUE
                       produce-file PRODUCER SEQUENCE TOPIC PARTITION|- KEY PATH
                       produce-lines PRODUCER FIRST_SEQUENCE TOPIC PARTITION|- KEY
@@ -103,6 +104,13 @@ public final class ClientMain {
             case "topics" -> {
                 arity(command, args, 0, 0);
                 client.topics().forEach((topic, count) -> out.printf("%s partitions=%d%n", topic, count));
+            }
+            case "expand" -> {
+                arity(command, args, 2, 2);
+                int target = bounded(args[1], 1, Settings.MAX_PARTITIONS, "partition count");
+                var expansion = client.expand(args[0], target);
+                out.printf("topic=%s partitions=%d..%d boundaries=%s%n", expansion.topic(),
+                        expansion.previousPartitions(), expansion.partitionCount(), expansion.boundaries());
             }
             case "produce", "produce-file" -> {
                 arity(command, args, 6, 6);

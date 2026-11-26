@@ -84,6 +84,27 @@ public final class GroupDirectory {
         return true;
     }
 
+    /**
+     * Makes freshly added partitions durable in every group subscribed to the
+     * expanded topic and advances the generation of connected groups so their
+     * members rebalance onto the new partitions.
+     */
+    public void expandTopic(String topic, List<TopicPartition> added) throws IOException {
+        for (GroupState group : groups.values()) {
+            if (!group.subscriptions().contains(topic)) {
+                continue;
+            }
+            boolean generationChange = group.memberCount() > 0;
+            group.adoptPartitions(added);
+            store.save(group, generationChange);
+        }
+    }
+
+    public List<String> groupsSubscribedTo(String topic) {
+        return groups.values().stream().filter(group -> group.subscriptions().contains(topic))
+                .map(GroupState::name).toList();
+    }
+
     public GroupState require(String group) throws BrokerException {
         GroupState state = groups.get(group);
         if (state == null) {

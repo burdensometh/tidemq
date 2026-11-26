@@ -34,6 +34,7 @@ public record Settings(
         long retentionIntervalMs) {
     public static final int MAX_IDENTIFIER = 64;
     public static final int MAX_KEY_BYTES = 256;
+    public static final int MAX_PARTITIONS = 64;
     public static final int MIN_FRAME_BYTES = 1024;
     public static final int MAX_FRAME_BYTES = 64 * 1024 * 1024;
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_-]{0,63}");

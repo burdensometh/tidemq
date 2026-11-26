@@ -117,6 +117,7 @@ final class Session {
                 var view = broker.topics();
                 yield Binary.encode(out -> WireValues.writeTopics(out, view));
             }
+            case EXPAND -> expand(body);
             case PARTITION -> partition(body);
             case GROUP -> {
                 String name = read(body, in -> WireValues.identifier(in, "group"));
@@ -172,6 +173,12 @@ final class Session {
         var receipt = broker.produce(produce.producer(), produce.sequence(), produce.topic(),
                 produce.partition(), produce.key(), produce.value());
         return Binary.encode(out -> WireValues.writeReceipt(out, receipt));
+    }
+
+    private byte[] expand(byte[] body) throws IOException {
+        var request = read(body, WireValues::readExpansion);
+        var expansion = broker.expand(request.topic(), request.targetPartitions());
+        return Binary.encode(out -> WireValues.writeExpansion(out, expansion));
     }
 
     private byte[] join(byte[] body) throws IOException {

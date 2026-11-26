@@ -150,6 +150,23 @@ public final class Broker implements AutoCloseable {
         return run(segments::topics);
     }
 
+    public SegmentStore.Expansion expand(String topic, int targetPartitions) throws IOException {
+        return run(() -> {
+            long now = now();
+            SegmentStore.Expansion expansion = segments.expand(topic, targetPartitions, now);
+            var added = new java.util.ArrayList<tidemq.segment.TopicPartition>(
+                    targetPartitions - expansion.previousPartitions());
+            for (int number = expansion.previousPartitions(); number < targetPartitions; number++) {
+                added.add(new TopicPartition(topic, number));
+            }
+            groups.expandTopic(topic, added);
+            for (String group : groups.groupsSubscribedTo(topic)) {
+                delivery.invalidate(group, now);
+            }
+            return expansion;
+        });
+    }
+
     public int retire() throws IOException {
         return run(() -> retire(now()));
     }

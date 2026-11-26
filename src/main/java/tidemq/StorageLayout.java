@@ -13,7 +13,7 @@ final class StorageLayout {
     private static final String MARKER = "storage.v1";
     private static final byte[] VERSION = "TideMQ broker storage v1\n".getBytes(StandardCharsets.UTF_8);
     private static final List<String> REQUIRED_FILES = List.of(
-            "segments/topology.v1", "produce.v1.journal", "deadletter.v1.journal");
+            "segments/topology.v1", "route.v1.journal", "produce.v1.journal", "deadletter.v1.journal");
 
     private final Path root;
     private final boolean initialized;

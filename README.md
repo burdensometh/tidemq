@@ -22,6 +22,7 @@ client=(java -cp build/tidemq.jar tidemq.ClientMain 127.0.0.1 7410)
 "${client[@]}" group warehouse
 "${client[@]}" flow warehouse
 "${client[@]}" partition orders 0
+"${client[@]}" expand orders 5
 "${client[@]}" deadletters warehouse
 "${client[@]}" retention orders 0
 ```
@@ -37,6 +38,8 @@ Java 客户端提供 `TideClient` 的底层操作，也提供 `ResumableProducer
 - 拉取先预留。标准客户端完整读取并解码 PULL 成功帧，再发送 `ACCEPT`，此时才增加持久尝试次数。发送成功前断线产生的预留可直接释放。已接受的租约在超时、离开代或断线时可重新投递。最后一次已接受租约失效后，代理先持久化死信，再推进组水位。
 - ACK 只能结算当前代、当前成员会话中已接受的租约。一批 ACK 在一次组快照内更新。水位是下一个未完成偏移，晚到 ACK 和终态死信只能关闭各自的洞。ACK 回复丢失时可观察组水位，并容忍重复读取。
 - 仅回收连续的已封口前缀段。段右端必须不大于所有订阅组的最小连续水位，且达到配置的最短保留年龄。离线组仍参与。无订阅组时使用分区结束偏移。回收永远保留活跃段，并保留独立存储的生产和死信回执。
+- 话题可用 `EXPAND`（CLI `expand TOPIC PARTITIONS`）在线增加分区，无需重启。每次扩容在 `route.v1.journal` 持久一代，记录新分区数和扩容瞬间各既有分区的结束偏移；自动路由按生产时刻的分区数取模，因此同一键的旧路由与新路由分界明确且重启保持。扩容分两次强制落盘，未完成提交的代在启动时截断回滚。
+- 扩容引入的新分区对既有订阅组默认不可见，直到该组确认完扩容边界之前所有旧分区的消息；此后同一键改投新分区的消息才投递，保证先看到旧分区消息、再看到新分区消息。在线成员会推进持久成员代并重平衡到新分区，离线组在下次加入时以水位 0 接纳新分区。扩容前已落的生产回执和偏移继续可查，原请求重发仍返回原回执（`replayed=true`），不产生新条目。
 - `delivery.max.batch` 限制每条批操作的记录数。`delivery.max.inflight` 限制每成员的同时预留及已接受租约总数。`delivery.window` 限制水位之后每分区可探测的偏移范围。帧预算会进一步限制 PULL 或死信查询返回行数。
 - `segment.bytes` 改变未来滚段阈值。话题及分区拓扑落盘后固定。重试阈值取进程使用的配置，重启时会重判已丢失活跃租约且达到阈值的条目。
 - 物理存储发生写入或持久边界异常时，代理报告 `STORAGE_FAILURE`，并要求重启以恢复索引。v1 能修复活跃段或日志最后一个物理长度不足的记录，完整记录校验失败会拒绝打开。
@@ -61,6 +64,7 @@ bash scripts/bench.sh 1024
 | 职责 | 入口 |
 | --- | --- |
 | 生产、路由和收据 | `ingress/Ingress`、`ingress/ReceiptIndex` |
+| 路由代际与在线扩容 | `segment/RouteJournal`、`segment/RouteGeneration`、`segment/SegmentStore` |
 | 段、偏移索引与回收 | `segment/SegmentStore`、`segment/PartitionLog`、`segment/RecordFile` |
 | 成员代、分配和水位 | `group/GroupDirectory`、`group/GroupStore`、`group/AckFrontier` |
 | 流量窗口、接受和确认 | `delivery/DeliveryEngine`、`delivery/LeaseBook` |

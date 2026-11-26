@@ -165,10 +165,38 @@ public final class DeliveryEngine {
         for (TopicPartition partition : assigned) {
             AckFrontier frontier = group.frontier(partition);
             long first = frontier.next();
-            long last = Math.min(segments.range(partition).nextOffset(), deadline(first, settings.deliveryWindow()));
+            long last = Math.min(visibleEnd(group, partition), deadline(first, settings.deliveryWindow()));
             cursors.add(new Cursor(partition, frontier, first, last));
         }
         return select(epoch, session, capacity, byteBudget, now, book, cursors);
+    }
+
+    /**
+     * Upper bound (exclusive) of offsets this group may read from a partition.
+     * A partition introduced by an online expansion stays invisible until the
+     * group has confirmed every pre-expansion message in all partitions that
+     * existed at that moment. Only then may messages whose key moved into the
+     * new partition appear, preserving per-key old-partition-before-new-partition
+     * ordering across the route boundary. Partitions that already existed before
+     * an expansion are always readable up to their physical end.
+     */
+    private long visibleEnd(GroupState group, TopicPartition partition) throws IOException {
+        long physicalEnd = segments.range(partition).nextOffset();
+        var history = segments.routeHistory(partition.topic());
+        for (int generation = 1; generation < history.size(); generation++) {
+            List<Long> boundaries = history.get(generation).boundaries();
+            // Only partitions added by this generation are gated by it.
+            if (partition.partition() < boundaries.size()) {
+                continue;
+            }
+            for (int prior = 0; prior < boundaries.size(); prior++) {
+                AckFrontier frontier = group.frontier(new TopicPartition(partition.topic(), prior));
+                if (frontier == null || frontier.next() < boundaries.get(prior)) {
+                    return 0;
+                }
+            }
+        }
+        return physicalEnd;
     }
 
     private List<DeliveryLease> select(GroupEpoch epoch, long session, int limit, int byteBudget, long now,

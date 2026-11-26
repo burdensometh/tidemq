@@ -34,6 +34,20 @@ public final class Ingress {
         if (key.length > Settings.MAX_KEY_BYTES || value.length > messageLimit) {
             throw new BrokerException(BrokerException.Code.BAD_REQUEST, "key or payload exceeds configured limit");
         }
+        // Idempotent recovery is resolved before routing. A resend of the original
+        // identity returns its original receipt even when automatic routing would
+        // now place the key in an added partition, and never appends a second entry.
+        // The fingerprint is rebuilt against the receipt's own partition so that a
+        // changed route does not masquerade as a producer conflict.
+        ReceiptIndex.Entry previous = receipts.lookup(identity);
+        if (previous != null) {
+            byte[] priorDigest = ReceiptIndex.fingerprint(previous.receipt().partition(), key, value);
+            if (!Arrays.equals(previous.hash(), priorDigest)) {
+                throw new BrokerException(BrokerException.Code.PRODUCER_CONFLICT,
+                        "producer sequence already has a different message");
+            }
+            return previous.receipt().asReplay();
+        }
         int partitionCount = segments.partitionCount(topic);
         int resolved = partition;
         if (partition == ROUTE_BY_KEY) {
@@ -47,14 +61,6 @@ public final class Ingress {
         }
         var route = new TopicPartition(topic, resolved);
         byte[] digest = ReceiptIndex.fingerprint(route, key, value);
-        ReceiptIndex.Entry previous = receipts.lookup(identity);
-        if (previous != null) {
-            if (!Arrays.equals(previous.hash(), digest)) {
-                throw new BrokerException(BrokerException.Code.PRODUCER_CONFLICT,
-                        "producer sequence already has a different message");
-            }
-            return previous.receipt().asReplay();
-        }
         Message message = segments.append(route, producer, sequence, key, value, now);
         return receipts.record(message, digest);
     }

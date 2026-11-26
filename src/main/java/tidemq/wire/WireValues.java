@@ -31,7 +31,7 @@ import java.util.TreeSet;
 final class WireValues {
     static final int VERSION = 1;
     static final int MAX_TOPICS = 16;
-    static final int MAX_PARTITIONS = 64;
+    static final int MAX_PARTITIONS = Settings.MAX_PARTITIONS;
     static final int MAX_BATCH = 256;
     static final int MAX_SEGMENTS = 128;
     static final int MAX_MEMBERS = 256;
@@ -45,6 +45,7 @@ final class WireValues {
     record Settlement(long epoch, List<DeliveryLease.Ref> refs) {}
     record PartitionQuery(TopicPartition partition, int limit) {}
     record DeadLetterQuery(String group, long cursor, int limit) {}
+    record ExpansionRequest(String topic, int targetPartitions) {}
 
     private WireValues() {}
 
@@ -230,6 +231,42 @@ final class WireValues {
             putUnique(result, MessageV1.readPartition(in), in.readLong());
         }
         return Collections.unmodifiableMap(result);
+    }
+
+    static ExpansionRequest readExpansion(DataInputStream in) throws IOException {
+        String topic = identifier(in, "topic");
+        int target = in.readInt();
+        if (target < 1 || target > MAX_PARTITIONS) {
+            throw new IOException("invalid target partition count");
+        }
+        return new ExpansionRequest(topic, target);
+    }
+
+    static void writeExpansion(DataOutputStream out, SegmentStore.Expansion expansion) throws IOException {
+        Binary.writeText(out, expansion.topic());
+        out.writeInt(expansion.previousPartitions());
+        out.writeInt(expansion.partitionCount());
+        out.writeInt(expansion.boundaries().size());
+        for (long boundary : expansion.boundaries()) {
+            out.writeLong(boundary);
+        }
+    }
+
+    static SegmentStore.Expansion readExpansionResponse(DataInputStream in) throws IOException {
+        String topic = identifier(in, "topic");
+        int previous = in.readInt();
+        int current = in.readInt();
+        int boundaries = Binary.readCount(in, MAX_PARTITIONS);
+        var values = new ArrayList<Long>(boundaries);
+        for (int i = 0; i < boundaries; i++) {
+            long value = in.readLong();
+            if (value < 0) {
+                throw new IOException("negative routing boundary");
+            }
+            values.add(value);
+        }
+        var generation = new tidemq.segment.RouteGeneration(current, List.copyOf(values));
+        return new SegmentStore.Expansion(topic, previous, current, generation, List.copyOf(values));
     }
 
     static void writeTopics(DataOutputStream out, Map<String, Integer> topics) throws IOException {
