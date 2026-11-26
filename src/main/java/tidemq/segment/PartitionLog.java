@@ -5,7 +5,9 @@ import tidemq.Boundary;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 
@@ -59,11 +61,57 @@ final class PartitionLog {
     }
 
     Message read(long offset) throws IOException {
-        var candidate = segments.floorEntry(offset);
-        if (candidate == null || offset >= candidate.getValue().endOffset()) {
-            throw new IOException("offset " + offset + " outside current range of " + partition);
+        try (Reader reader = reader()) {
+            return reader.read(offset);
         }
-        return candidate.getValue().get(offset);
+    }
+
+    Reader reader() {
+        return new Reader();
+    }
+
+    /**
+     * Reuses one channel per segment touched by a walk, so a sequential scan
+     * pays one open per segment rather than one per record. Only segments that
+     * are actually visited get a channel; a reader is valid for as long as no
+     * segment is appended to or retired.
+     */
+    final class Reader implements AutoCloseable {
+        private final Map<Segment, RecordFile.Reader> readers = new HashMap<>();
+
+        Message read(long offset) throws IOException {
+            var candidate = segments.floorEntry(offset);
+            if (candidate == null || offset >= candidate.getValue().endOffset()) {
+                throw new IOException("offset " + offset + " outside current range of " + partition);
+            }
+            Segment segment = candidate.getValue();
+            RecordFile.Reader source = readers.get(segment);
+            if (source == null) {
+                source = segment.reader();
+                readers.put(segment, source);
+            }
+            return segment.get(offset, source);
+        }
+
+        @Override
+        public void close() throws IOException {
+            IOException first = null;
+            for (RecordFile.Reader source : readers.values()) {
+                try {
+                    source.close();
+                } catch (IOException error) {
+                    if (first == null) {
+                        first = error;
+                    } else {
+                        first.addSuppressed(error);
+                    }
+                }
+            }
+            readers.clear();
+            if (first != null) {
+                throw first;
+            }
+        }
     }
 
     long low() {

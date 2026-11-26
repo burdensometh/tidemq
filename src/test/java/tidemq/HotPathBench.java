@@ -42,13 +42,16 @@ public final class HotPathBench {
                 consumer.leave();
                 long measured = consumer.join("measure", "m", TOPICS).number();
                 var durations = new ArrayList<Long>();
+                tidemq.segment.RecordFile.resetReadOpenCount();
                 long start = System.nanoTime();
                 drain(consumer, measured, messages, durations);
                 long elapsed = System.nanoTime() - start;
+                long opens = tidemq.segment.RecordFile.readOpenCount();
                 eq((long) messages, consumer.group("measure").frontiers().get(ORDERS).next());
                 report("batch-pull+accept+ack", durations);
-                System.out.printf("batch_messages=%d messages_per_second=%.1f%n",
-                        messages, messages * 1_000_000_000d / elapsed);
+                System.out.printf("batch_messages=%d messages_per_second=%.1f records_per_open=%.1f%n",
+                        messages, messages * 1_000_000_000d / elapsed, messages / (double) opens);
+                System.out.printf("batch_segment_opens=%d%n", opens);
             }
         }
     }
@@ -67,16 +70,20 @@ public final class HotPathBench {
             eq(0L, frontier.next());
             eq(127, frontier.ahead());
             var blocked = new ArrayList<Long>();
+            tidemq.segment.RecordFile.resetReadOpenCount();
             for (int i = 0; i < SCANS; i++) {
                 long t = System.nanoTime();
                 eq(List.of(), consumer.pull(epoch, 16));
                 blocked.add(System.nanoTime() - t);
             }
+            long blockedOpens = tidemq.segment.RecordFile.readOpenCount();
+            eq(0L, blockedOpens);
             eq(128L, BrokerTest.ack(consumer, epoch, first).get(ORDERS));
             drain(consumer, epoch, 128, null);
             eq(256L, consumer.group("slow").frontiers().get(ORDERS).next());
             report("slow-consumer-out-of-order-batch", outOfOrder);
             report("slow-consumer-window-blocked-pull", blocked);
+            System.out.printf("slow_consumer_blocked_scans=%d segment_opens=%d%n", SCANS, blockedOpens);
         }
     }
 

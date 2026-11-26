@@ -84,22 +84,25 @@ public final class DeadLetters {
         }
         var results = new ArrayList<DeadLetterReceipt>();
         long cursor = Math.max(from, nextSequence);
-        for (var entry : groupIndex.tailMap(from, true).entrySet()) {
-            if (results.size() == limit) {
-                cursor = entry.getKey();
-                break;
-            }
-            DeadLetterReceipt receipt = decode(file.read(entry.getValue()));
-            int encodedBytes = receipt.wireBytes();
-            if (encodedBytes > byteBudget) {
-                if (results.isEmpty()) {
-                    throw new BrokerException(BrokerException.Code.CAPACITY, "dead-letter record exceeds negotiated frame");
+        try (RecordFile.Reader reader = file.reader()) {
+            for (var entry : groupIndex.tailMap(from, true).entrySet()) {
+                if (results.size() == limit) {
+                    cursor = entry.getKey();
+                    break;
                 }
-                cursor = entry.getKey();
-                break;
+                DeadLetterReceipt receipt = decode(reader.read(entry.getValue()));
+                int encodedBytes = receipt.wireBytes();
+                if (encodedBytes > byteBudget) {
+                    if (results.isEmpty()) {
+                        throw new BrokerException(BrokerException.Code.CAPACITY,
+                                "dead-letter record exceeds negotiated frame");
+                    }
+                    cursor = entry.getKey();
+                    break;
+                }
+                results.add(receipt);
+                byteBudget -= encodedBytes;
             }
-            results.add(receipt);
-            byteBudget -= encodedBytes;
         }
         return new Page(cursor, List.copyOf(results));
     }

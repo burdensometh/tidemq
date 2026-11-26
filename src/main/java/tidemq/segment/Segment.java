@@ -85,11 +85,21 @@ public final class Segment {
     }
 
     Message get(long offset) throws IOException {
-        Message message = decode(file.read(index.position(offset)), partition);
+        try (RecordFile.Reader reader = file.reader()) {
+            return get(offset, reader);
+        }
+    }
+
+    Message get(long offset, RecordFile.Reader reader) throws IOException {
+        Message message = decode(reader.read(index.position(offset)), partition);
         if (message.offset() != offset) {
             throw new IOException("segment index disagreement at offset " + offset);
         }
         return message;
+    }
+
+    RecordFile.Reader reader() {
+        return file.reader();
     }
 
     public void forEach(MessageVisitor visitor) throws IOException {

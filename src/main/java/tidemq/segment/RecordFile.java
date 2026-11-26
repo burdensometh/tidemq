@@ -6,12 +6,17 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.concurrent.atomic.LongAdder;
 
 public final class RecordFile {
     public static final int VERSION = 1;
     public static final int HEADER_BYTES = 24;
     public static final int RECORD_OVERHEAD = 8;
     public static final int MAX_BODY = 9 * 1024 * 1024;
+
+    private static final int READ_WINDOW_BYTES = 8 * 1024;
+    private static final byte[] EMPTY_WINDOW = new byte[0];
+    private static final LongAdder READ_OPENS = new LongAdder();
 
     public record Header(int magic, long baseOffset, long createdAtMs) {}
 
@@ -67,6 +72,19 @@ public final class RecordFile {
             throw new IOException("invalid v1 record file header");
         }
         return new Header(magic, base, created);
+    }
+
+    public static long readOpenCount() {
+        return READ_OPENS.sum();
+    }
+
+    public static void resetReadOpenCount() {
+        READ_OPENS.reset();
+    }
+
+    private static FileChannel openForRead(Path path) throws IOException {
+        READ_OPENS.increment();
+        return FileChannel.open(path, StandardOpenOption.READ);
     }
 
     private static long scan(FileChannel file, boolean repairTail, Visitor visitor) throws IOException {
@@ -135,14 +153,126 @@ public final class RecordFile {
     }
 
     public byte[] read(long position) throws IOException {
-        try (FileChannel file = FileChannel.open(path, StandardOpenOption.READ)) {
-            return readBody(file, position, readLength(file, position));
+        try (Reader reader = reader()) {
+            return reader.read(position);
         }
+    }
+
+    public Reader reader() {
+        return new Reader(this);
     }
 
     public void forEach(Visitor visitor) throws IOException {
         try (FileChannel file = FileChannel.open(path, StandardOpenOption.READ)) {
             scan(file, false, visitor);
+        }
+    }
+
+    /**
+     * A read-only view over one record file that keeps its channel open and
+     * buffers a byte window, so consecutive records in the same segment are
+     * served without reopening the file or issuing one positional read each.
+     */
+    public static final class Reader implements AutoCloseable {
+        private final RecordFile file;
+        private FileChannel channel;
+        private byte[] window = EMPTY_WINDOW;
+        private long windowStart = -1;
+        private long windowEnd = -1;
+
+        private Reader(RecordFile file) {
+            this.file = file;
+        }
+
+        public byte[] read(long position) throws IOException {
+            byte[] body = block(position);
+            if (body != null) {
+                return body;
+            }
+            FileChannel channel = channel();
+            int length = Disk.read(channel, position, Integer.BYTES).getInt();
+            checkLength(length, position);
+            return readBody(channel, position, length);
+        }
+
+        /** Returns the verified body when the window covers the whole record, else null. */
+        private byte[] block(long position) throws IOException {
+            if (!covers(position, Integer.BYTES)) {
+                refresh(position);
+                if (!covers(position, Integer.BYTES)) {
+                    return null;
+                }
+            }
+            int length = intAt(position);
+            checkLength(length, position);
+            long bodyPosition = position + Integer.BYTES;
+            int block = length + Integer.BYTES;
+            if (block > READ_WINDOW_BYTES) {
+                return null;
+            }
+            if (!covers(bodyPosition, block)) {
+                refresh(bodyPosition);
+                if (!covers(bodyPosition, block)) {
+                    return null;
+                }
+            }
+            byte[] body = new byte[length];
+            System.arraycopy(window, (int) (bodyPosition - windowStart), body, 0, length);
+            if (intAt(bodyPosition + length) != Disk.checksum(body)) {
+                throw new IOException("checksum mismatch at byte " + position);
+            }
+            return body;
+        }
+
+        private static void checkLength(int length, long position) throws IOException {
+            if (length <= 0 || length > MAX_BODY) {
+                throw new IOException("invalid record length " + length + " at byte " + position);
+            }
+        }
+
+        private int intAt(long position) {
+            int at = (int) (position - windowStart);
+            return ((window[at] & 0xff) << 24) | ((window[at + 1] & 0xff) << 16)
+                    | ((window[at + 2] & 0xff) << 8) | (window[at + 3] & 0xff);
+        }
+
+        private boolean covers(long position, int count) {
+            return position >= windowStart && windowEnd - position >= count;
+        }
+
+        private FileChannel channel() throws IOException {
+            if (channel == null) {
+                channel = openForRead(file.path);
+            }
+            return channel;
+        }
+
+        private void refresh(long position) throws IOException {
+            FileChannel source = channel();
+            long size = file.end;
+            if (position >= size) {
+                window = EMPTY_WINDOW;
+                windowStart = position;
+                windowEnd = position;
+                return;
+            }
+            int wanted = (int) Math.min(READ_WINDOW_BYTES, size - position);
+            ByteBuffer bytes = Disk.read(source, position, wanted);
+            window = bytes.array();
+            windowStart = position;
+            windowEnd = position + wanted;
+        }
+
+        @Override
+        public void close() throws IOException {
+            FileChannel open = channel;
+            channel = null;
+            window = EMPTY_WINDOW;
+            windowStart = -1;
+            windowEnd = -1;
+            if (open != null) {
+                open.close();
+            }
         }
     }
 

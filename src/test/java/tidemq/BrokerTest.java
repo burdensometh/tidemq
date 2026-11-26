@@ -2,6 +2,7 @@ package tidemq;
 
 import tidemq.delivery.DeliveryLease;
 import tidemq.ingress.Ingress;
+import tidemq.segment.RecordFile;
 import tidemq.segment.Segment;
 import tidemq.segment.TopicPartition;
 import tidemq.wire.TcpBroker;
@@ -42,6 +43,7 @@ public final class BrokerTest {
                 new Case("unobserved-pull-does-not-use-attempt", BrokerTest::lostPullReply),
                 new Case("sdk-reconnects-without-reusing-old-batch", BrokerTest::sdkConsumer),
                 new Case("frame-budget-does-not-create-lease", BrokerTest::smallFrame),
+                new Case("pull-reuses-one-open-per-segment", BrokerTest::segmentReaderReuse),
                 new Case("accept-is-idempotent-with-fixed-deadline", BrokerTest::idempotentAccept),
                 new Case("lease-timeout-retries-and-terminal-delivery", BrokerTest::retry),
                 new Case("dead-letter-before-force-reconciled", () -> recoverDeadLetter(Boundary.Point.DEADLETTER_BEFORE_FORCE)),
@@ -240,6 +242,48 @@ public final class BrokerTest {
                 var deliveries = next.pull(newEpoch, 2);
                 eq(1, deliveries.getFirst().lease().attempt());
                 ack(next, newEpoch, deliveries);
+            }
+        }
+    }
+
+    private static void segmentReaderReuse() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, Map.of("orders", 1), 1000), new Time(), Boundary.NONE);
+             var producer = connect(server);
+             var denseReader = connect(server); var sparseReader = connect(server)) {
+            seed(producer, 16, bytes("packed"));
+            eq(1, denseReader.partition(P0, 8).segmentCount());
+            long dense = denseReader.join("dense", "m", ORDERS).number();
+            RecordFile.resetReadOpenCount();
+            var packed = denseReader.pull(dense, 16);
+            eq(16, packed.size());
+            eq(1L, RecordFile.readOpenCount());
+
+            for (int i = 0; i < 18; i++) {
+                publish(producer, "q", i, new byte[1000]);
+            }
+            long sparse = sparseReader.join("sparse", "m", ORDERS).number();
+            long frontier = 0;
+            while (frontier < 16) {
+                var advance = sparseReader.pull(sparse, 16);
+                check(!advance.isEmpty(), "cannot advance sparse group");
+                frontier = ack(sparseReader, sparse, advance).get(P0);
+            }
+            var views = sparseReader.partition(P0, 64).recent();
+            RecordFile.resetReadOpenCount();
+            var batch = sparseReader.pull(sparse, 6);
+            eq(List.of(16L, 17L, 18L, 19L, 20L, 21L), offsets(batch));
+            int opens = (int) RecordFile.readOpenCount();
+            int visited = 0;
+            for (var segment : views) {
+                if (segment.baseOffset() < 22 && segment.endOffset() > 16) {
+                    visited++;
+                }
+            }
+            check(visited > 1 && visited < batch.size(), "sparse batch must span a few segments");
+            eq(visited, opens);
+            for (var item : batch) {
+                eq(1000, item.lease().message().payloadSize());
             }
         }
     }

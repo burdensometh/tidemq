@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -86,6 +87,53 @@ public final class SegmentStore {
 
     public Message read(TopicPartition partition, long offset) throws IOException {
         return log(partition).read(offset);
+    }
+
+    public Reader reader() {
+        return new Reader();
+    }
+
+    /**
+     * Reuses one open channel per touched segment across a whole delivery
+     * selection, so both projects and checkpoints sharing this store keep
+     * their own view and never reopen a segment for each record.
+     */
+    public final class Reader implements AutoCloseable {
+        private final Map<TopicPartition, PartitionLog.Reader> logs = new HashMap<>();
+
+        public Message read(TopicPartition partition, long offset) throws IOException {
+            return forPartition(partition).read(offset);
+        }
+
+        PartitionLog.Reader forPartition(TopicPartition partition) throws BrokerException {
+            PartitionLog log = log(partition);
+            PartitionLog.Reader reader = logs.get(partition);
+            if (reader == null) {
+                reader = log.reader();
+                logs.put(partition, reader);
+            }
+            return reader;
+        }
+
+        @Override
+        public void close() throws IOException {
+            IOException first = null;
+            for (PartitionLog.Reader reader : logs.values()) {
+                try {
+                    reader.close();
+                } catch (IOException error) {
+                    if (first == null) {
+                        first = error;
+                    } else {
+                        first.addSuppressed(error);
+                    }
+                }
+            }
+            logs.clear();
+            if (first != null) {
+                throw first;
+            }
+        }
     }
 
     public Range range(TopicPartition partition) throws BrokerException {

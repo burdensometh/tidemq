@@ -35,27 +35,29 @@ public final class DeliveryEngine {
 
     public void recover(long now) throws IOException {
         var changed = new HashSet<GroupState>();
-        deadLetters.forEach(receipt -> {
-            GroupState group = groups.require(receipt.group());
-            Message message = receipt.message();
-            AckFrontier frontier = group.frontier(message.partition());
-            if (frontier == null || message.offset() >= segments.range(message.partition()).nextOffset()) {
-                throw new IOException("dead-letter source outside group partition");
-            }
-            if (!frontier.isComplete(message.offset())) {
-                if (frontier.attempts(message.offset()) != receipt.attempts()) {
-                    throw new IOException("dead-letter attempts disagree with group checkpoint");
+        try (SegmentStore.Reader reader = segments.reader()) {
+            deadLetters.forEach(receipt -> {
+                GroupState group = groups.require(receipt.group());
+                Message message = receipt.message();
+                AckFrontier frontier = group.frontier(message.partition());
+                if (frontier == null || message.offset() >= segments.range(message.partition()).nextOffset()) {
+                    throw new IOException("dead-letter source outside group partition");
                 }
-                frontier.complete(message.offset());
-                changed.add(group);
-            }
-        });
-        for (GroupState group : groups.states()) {
-            for (TopicPartition partition : group.partitions()) {
-                AckFrontier frontier = group.frontier(partition);
-                for (long offset : frontier.exhausted(settings.maxAttempts())) {
-                    terminal(group, partition, offset, now);
+                if (!frontier.isComplete(message.offset())) {
+                    if (frontier.attempts(message.offset()) != receipt.attempts()) {
+                        throw new IOException("dead-letter attempts disagree with group checkpoint");
+                    }
+                    frontier.complete(message.offset());
                     changed.add(group);
+                }
+            });
+            for (GroupState group : groups.states()) {
+                for (TopicPartition partition : group.partitions()) {
+                    AckFrontier frontier = group.frontier(partition);
+                    for (long offset : frontier.exhausted(settings.maxAttempts())) {
+                        terminal(group, partition, offset, now, reader);
+                        changed.add(group);
+                    }
                 }
             }
         }
@@ -128,22 +130,25 @@ public final class DeliveryEngine {
 
     private void dispose(GroupState group, LeaseBook book, List<LeaseBook.Entry> expired, long now) throws IOException {
         boolean advanced = false;
-        for (LeaseBook.Entry entry : expired) {
-            var ref = entry.ref();
-            if (entry.accepted() && group.frontier(ref.partition()).attempts(ref.offset()) >= settings.maxAttempts()) {
-                terminal(group, ref.partition(), ref.offset(), now);
-                advanced = true;
+        try (SegmentStore.Reader reader = segments.reader()) {
+            for (LeaseBook.Entry entry : expired) {
+                var ref = entry.ref();
+                if (entry.accepted() && group.frontier(ref.partition()).attempts(ref.offset()) >= settings.maxAttempts()) {
+                    terminal(group, ref.partition(), ref.offset(), now, reader);
+                    advanced = true;
+                }
+                book.remove(entry);
             }
-            book.remove(entry);
         }
         if (advanced) {
             groups.saveProgress(group);
         }
     }
 
-    private void terminal(GroupState group, TopicPartition partition, long offset, long now) throws IOException {
+    private void terminal(GroupState group, TopicPartition partition, long offset, long now,
+                          SegmentStore.Reader reader) throws IOException {
         AckFrontier frontier = group.frontier(partition);
-        Message message = segments.read(partition, offset);
+        Message message = reader.read(partition, offset);
         deadLetters.archive(group.name(), message, frontier.attempts(offset), now);
         frontier.complete(offset);
     }
@@ -178,30 +183,32 @@ public final class DeliveryEngine {
         int nextRound = start;
         boolean tooLarge = false;
         boolean added;
-        do {
-            added = false;
-            for (int step = 0; step < cursors.size() && leases.size() < limit; step++) {
-                int index = (start + step) % cursors.size();
-                Cursor cursor = cursors.get(index);
-                Message message = cursor.next(book);
-                if (message == null) {
-                    continue;
+        try (SegmentStore.Reader reader = segments.reader()) {
+            do {
+                added = false;
+                for (int step = 0; step < cursors.size() && leases.size() < limit; step++) {
+                    int index = (start + step) % cursors.size();
+                    Cursor cursor = cursors.get(index);
+                    Message message = cursor.next(book, reader);
+                    if (message == null) {
+                        continue;
+                    }
+                    int attempt = cursor.frontier.attempts(message.offset()) + 1;
+                    var candidate = new DeliveryLease(0, epoch.number(), 0, attempt, message);
+                    int size = candidate.wireBytes();
+                    if (size > byteBudget) {
+                        tooLarge = true;
+                        cursor.skipRound();
+                        continue;
+                    }
+                    long id = issueLease();
+                    leases.add(book.reserve(id, epoch, session, deadline(now, settings.reservationMs()), attempt, message));
+                    byteBudget -= size;
+                    added = true;
+                    nextRound = (index + 1) % cursors.size();
                 }
-                int attempt = cursor.frontier.attempts(message.offset()) + 1;
-                var candidate = new DeliveryLease(0, epoch.number(), 0, attempt, message);
-                int size = candidate.wireBytes();
-                if (size > byteBudget) {
-                    tooLarge = true;
-                    cursor.skipRound();
-                    continue;
-                }
-                long id = issueLease();
-                leases.add(book.reserve(id, epoch, session, deadline(now, settings.reservationMs()), attempt, message));
-                byteBudget -= size;
-                added = true;
-                nextRound = (index + 1) % cursors.size();
-            }
-        } while (added && leases.size() < limit);
+            } while (added && leases.size() < limit);
+        }
         book.partitionStart(epoch.member(), nextRound);
         if (leases.isEmpty() && tooLarge) {
             throw new BrokerException(BrokerException.Code.CAPACITY, "available message exceeds negotiated frame");
@@ -305,11 +312,11 @@ public final class DeliveryEngine {
             this.end = end;
         }
 
-        Message next(LeaseBook book) throws IOException {
+        Message next(LeaseBook book, SegmentStore.Reader reader) throws IOException {
             while (offset < end) {
                 long current = offset++;
                 if (!frontier.isComplete(current) && !book.has(partition, current)) {
-                    return segments.read(partition, current);
+                    return reader.read(partition, current);
                 }
             }
             return null;
