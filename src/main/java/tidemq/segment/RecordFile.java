@@ -134,6 +134,20 @@ public final class RecordFile {
         return position;
     }
 
+    public void truncate(long position) throws IOException {
+        if (position < HEADER_BYTES || position > end) {
+            throw new IOException("invalid truncate position " + position + " for " + path);
+        }
+        try (FileChannel file = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            if (file.size() < position) {
+                throw new IOException("record file is shorter than truncate position: " + path);
+            }
+            file.truncate(position);
+            file.force(true);
+            end = position;
+        }
+    }
+
     public byte[] read(long position) throws IOException {
         try (FileChannel file = FileChannel.open(path, StandardOpenOption.READ)) {
             return readBody(file, position, readLength(file, position));

@@ -88,6 +88,10 @@ public final class SegmentStore {
         return log(partition).read(offset);
     }
 
+    public void truncateTo(TopicPartition partition, long offset) throws IOException {
+        log(partition).truncateTo(offset);
+    }
+
     public Range range(TopicPartition partition) throws BrokerException {
         var log = log(partition);
         return new Range(log.low(), log.end());

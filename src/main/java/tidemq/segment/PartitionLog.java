@@ -66,6 +66,31 @@ final class PartitionLog {
         return candidate.getValue().get(offset);
     }
 
+    void truncateTo(long offset) throws IOException {
+        var targetEntry = segments.floorEntry(offset);
+        if (targetEntry == null) {
+            throw new IOException("truncate offset " + offset + " precedes " + partition
+                    + " base " + segments.firstKey());
+        }
+        Segment target = targetEntry.getValue();
+        if (offset > target.endOffset()) {
+            throw new IOException("truncate offset " + offset + " is outside " + partition
+                    + " range ending at " + last().endOffset());
+        }
+
+        // Remove all segments beyond the segment that owns the truncation point.
+        // At a roll boundary, floorEntry(offset) is the new empty segment; keeping
+        // it gives subsequent appends a valid active file with base == offset.
+        var laterBases = new ArrayList<>(segments.tailMap(targetEntry.getKey(), false).keySet());
+        for (Long base : laterBases) {
+            Segment removed = segments.remove(base);
+            if (removed != null) {
+                removed.remove();
+            }
+        }
+        target.truncateTo(offset);
+    }
+
     long low() {
         return segments.firstKey();
     }

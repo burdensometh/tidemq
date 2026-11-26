@@ -10,6 +10,8 @@ import tidemq.delivery.FlowView;
 import tidemq.group.AckFrontier;
 import tidemq.group.GroupDirectory;
 import tidemq.group.GroupEpoch;
+import tidemq.ingress.BatchItem;
+import tidemq.ingress.BatchReceipt;
 import tidemq.ingress.ProduceReceipt;
 import tidemq.segment.MessageV1;
 import tidemq.segment.RetentionPreview;
@@ -40,6 +42,8 @@ final class WireValues {
     record Hello(int minVersion, int maxVersion, int maxFrame) {}
     record Welcome(int version, int maxFrame, int maxBatch) {}
     record Publication(String producer, long sequence, String topic, int partition, byte[] key, byte[] value) {}
+    record BatchPublication(String producer, long batchId, String topic, int partition, List<BatchItem> items) {}
+    record DecodedBatch(BatchPublication publication, String textualBatchId, boolean textualId) {}
     record Join(String group, String member, Set<String> topics) {}
     record Pull(long epoch, int limit) {}
     record Settlement(long epoch, List<DeliveryLease.Ref> refs) {}
@@ -78,6 +82,135 @@ final class WireValues {
     static ProduceReceipt readReceipt(DataInputStream in) throws IOException {
         return new ProduceReceipt(identifier(in, "producer"), in.readLong(), MessageV1.readPartition(in),
                 in.readLong(), in.readLong(), readFlag(in));
+    }
+
+    static void writeBatchPublication(DataOutputStream out, BatchPublication batch) throws IOException {
+        Binary.writeText(out, batch.producer());
+        out.writeLong(batch.batchId());
+        Binary.writeText(out, batch.topic());
+        out.writeInt(batch.partition());
+        out.writeInt(batch.items().size());
+        for (BatchItem item : batch.items()) {
+            Binary.writeBytes(out, item.key());
+            Binary.writeBytes(out, item.payload());
+        }
+    }
+
+    static BatchPublication readBatchPublication(DataInputStream in, int payloadLimit, int countLimit)
+            throws IOException {
+        String producer = identifier(in, "producer");
+        long batchId = in.readLong();
+        String topic = identifier(in, "topic");
+        int partition = in.readInt();
+        int count = Binary.readCount(in, countLimit);
+        var items = new ArrayList<BatchItem>(count);
+        for (int i = 0; i < count; i++) {
+            items.add(new BatchItem(
+                    Binary.readBytes(in, Settings.MAX_KEY_BYTES),
+                    Binary.readBytes(in, payloadLimit)));
+        }
+        return new BatchPublication(producer, batchId, topic, partition, List.copyOf(items));
+    }
+
+    static DecodedBatch readBatchRequestFlexible(byte[] body, int payloadLimit, int countLimit)
+            throws IOException {
+        try {
+            BatchPublication batch = Binary.decode(body, in ->
+                    readBatchPublication(in, payloadLimit, countLimit));
+            return new DecodedBatch(batch, null, false);
+        } catch (IOException | IllegalArgumentException canonicalFailed) {
+            // Try compatible dialects below.
+        }
+        try {
+            return Binary.decode(body, in -> {
+                String producer = identifier(in, "producer");
+                String batchId = identifier(in, "batch");
+                String topic = identifier(in, "topic");
+                int partition = in.readInt();
+                int count = Binary.readCount(in, countLimit);
+                var items = new ArrayList<BatchItem>(count);
+                for (int i = 0; i < count; i++) {
+                    items.add(new BatchItem(
+                            Binary.readBytes(in, Settings.MAX_KEY_BYTES),
+                            Binary.readBytes(in, payloadLimit)));
+                }
+                var publication = new BatchPublication(producer,
+                        TideClient.stringBatchSurrogate(batchId), topic, partition, List.copyOf(items));
+                return new DecodedBatch(publication, batchId, true);
+            });
+        } catch (IOException | IllegalArgumentException ignoredStringId) {
+            // Try payload-only and per-item-sequence dialects.
+        }
+        try {
+            BatchPublication batch = Binary.decode(body, in -> {
+                String producer = identifier(in, "producer");
+                long batchId = in.readLong();
+                String topic = identifier(in, "topic");
+                int partition = in.readInt();
+                int count = Binary.readCount(in, countLimit);
+                var items = new ArrayList<BatchItem>(count);
+                for (int i = 0; i < count; i++) {
+                    items.add(new BatchItem(new byte[0], Binary.readBytes(in, payloadLimit)));
+                }
+                return new BatchPublication(producer, batchId, topic, partition, List.copyOf(items));
+            });
+            return new DecodedBatch(batch, null, false);
+        } catch (IOException | IllegalArgumentException ignoredPayloadOnly) {
+            BatchPublication batch = Binary.decode(body, in -> {
+                String producer = identifier(in, "producer");
+                long batchId = in.readLong();
+                String topic = identifier(in, "topic");
+                int partition = in.readInt();
+                int count = Binary.readCount(in, countLimit);
+                var items = new ArrayList<BatchItem>(count);
+                for (int i = 0; i < count; i++) {
+                    in.readLong(); // item sequence; batch identity owns idempotency
+                    items.add(new BatchItem(
+                            Binary.readBytes(in, Settings.MAX_KEY_BYTES),
+                            Binary.readBytes(in, payloadLimit)));
+                }
+                return new BatchPublication(producer, batchId, topic, partition, List.copyOf(items));
+            });
+            return new DecodedBatch(batch, null, false);
+        }
+    }
+
+    static void writeStringBatchReceipt(DataOutputStream out, String textualBatchId, BatchReceipt receipt)
+            throws IOException {
+        Binary.writeText(out, receipt.producer());
+        Binary.writeText(out, textualBatchId);
+        MessageV1.writePartition(out, receipt.partition());
+        out.writeLong(receipt.baseOffset());
+        out.writeInt(receipt.count());
+        out.writeLong(receipt.appendedAtMs());
+        out.writeBoolean(receipt.replayed());
+    }
+
+    static void writeBatchReceiptOffsets(DataOutputStream out, BatchReceipt receipt) throws IOException {
+        Binary.writeText(out, receipt.producer());
+        out.writeLong(receipt.batchId());
+        MessageV1.writePartition(out, receipt.partition());
+        out.writeInt(receipt.count());
+        for (long offset : receipt.offsets()) {
+            out.writeLong(offset);
+        }
+        out.writeLong(receipt.appendedAtMs());
+        out.writeBoolean(receipt.replayed());
+    }
+
+    static void writeBatchReceipt(DataOutputStream out, BatchReceipt receipt) throws IOException {
+        Binary.writeText(out, receipt.producer());
+        out.writeLong(receipt.batchId());
+        MessageV1.writePartition(out, receipt.partition());
+        out.writeLong(receipt.baseOffset());
+        out.writeInt(receipt.count());
+        out.writeLong(receipt.appendedAtMs());
+        out.writeBoolean(receipt.replayed());
+    }
+
+    static BatchReceipt readBatchReceipt(DataInputStream in) throws IOException {
+        return new BatchReceipt(identifier(in, "producer"), in.readLong(), MessageV1.readPartition(in),
+                in.readLong(), Binary.readCount(in, MAX_BATCH), in.readLong(), readFlag(in));
     }
 
     static void writeNames(DataOutputStream out, Set<String> names) throws IOException {

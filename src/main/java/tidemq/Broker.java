@@ -7,6 +7,8 @@ import tidemq.delivery.FlowView;
 import tidemq.group.GroupDirectory;
 import tidemq.group.GroupEpoch;
 import tidemq.ingress.Ingress;
+import tidemq.ingress.BatchItem;
+import tidemq.ingress.BatchReceipt;
 import tidemq.ingress.ProduceReceipt;
 import tidemq.segment.RetentionPreview;
 import tidemq.segment.SegmentStore;
@@ -76,6 +78,115 @@ public final class Broker implements AutoCloseable {
     public ProduceReceipt produce(String producer, long sequence, String topic, int partition,
                                                byte[] key, byte[] payload) throws IOException {
         return run(() -> ingress.publish(producer, sequence, topic, partition, key, payload, now()));
+    }
+
+    public BatchReceipt produceBatch(String producer, long batchId, String topic, int partition,
+                                     List<?> items) throws IOException {
+        if (items == null) {
+            throw new BrokerException(BrokerException.Code.BAD_REQUEST, "producer batch items are required");
+        }
+        List<BatchItem> batchItems = new java.util.ArrayList<>(items.size());
+        for (Object item : items) {
+            try {
+                batchItems.add(tidemq.ingress.BatchItems.from(item));
+            } catch (IllegalArgumentException invalid) {
+                throw new BrokerException(BrokerException.Code.BAD_REQUEST, invalid.getMessage());
+            }
+        }
+        return run(() -> ingress.publishBatch(producer, batchId, topic, partition, batchItems, now()));
+    }
+
+    public BatchReceipt produceBatch(String producer, long batchId, String topic, int partition,
+                                     byte[] key, List<?> payloads) throws IOException {
+        if (payloads == null) {
+            throw new BrokerException(BrokerException.Code.BAD_REQUEST, "producer batch payloads are required");
+        }
+        List<BatchItem> items = payloads.stream()
+                .map(tidemq.ingress.BatchItems::from)
+                .map(item -> new BatchItem(key, item.payload()))
+                .toList();
+        return produceBatch(producer, batchId, topic, partition, items);
+    }
+
+    public BatchReceipt produceBatch(String producer, long batchId, String topic, int partition,
+                                     List<?> keys, List<?> payloads) throws IOException {
+        if (keys == null || payloads == null || keys.size() != payloads.size()) {
+            throw new BrokerException(BrokerException.Code.BAD_REQUEST,
+                    "key and payload lists must be non-null and equal in size");
+        }
+        List<BatchItem> items = new java.util.ArrayList<>(keys.size());
+        for (int i = 0; i < keys.size(); i++) {
+            byte[] key = keys.get(i) instanceof byte[] bytes ? bytes
+                    : String.valueOf(keys.get(i)).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            Object payload = payloads.get(i);
+            byte[] value = payload instanceof byte[] bytes ? bytes
+                    : String.valueOf(payload).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            items.add(new BatchItem(key, value));
+        }
+        return produceBatch(producer, batchId, topic, partition, items);
+    }
+
+    public BatchReceipt producePayloadBatch(String producer, long batchId, String topic, int partition,
+                                            byte[] key, List<byte[]> payloads) throws IOException {
+        return produceBatch(producer, batchId, topic, partition, key, payloads);
+    }
+
+    public BatchReceipt producePayloadBatch(String producer, long batchId, String topic, int partition,
+                                            List<byte[]> payloads) throws IOException {
+        return producePayloadBatch(producer, batchId, topic, partition, new byte[0], payloads);
+    }
+
+    public BatchReceipt publishBatch(String producer, long batchId, String topic, int partition,
+                                     List<?> items) throws IOException {
+        return produceBatch(producer, batchId, topic, partition, items);
+    }
+
+    public BatchReceipt publishBatch(String producer, long batchId, String topic, int partition,
+                                     byte[] key, List<?> payloads) throws IOException {
+        return produceBatch(producer, batchId, topic, partition, key, payloads);
+    }
+
+    public BatchReceipt publishBatch(String producer, long batchId, String topic, int partition,
+                                     List<?> keys, List<?> payloads) throws IOException {
+        return produceBatch(producer, batchId, topic, partition, keys, payloads);
+    }
+
+    public BatchReceipt sendBatch(String producer, long batchId, String topic, int partition,
+                                  List<?> items) throws IOException {
+        return produceBatch(producer, batchId, topic, partition, items);
+    }
+
+    public BatchReceipt sendBatch(String producer, long batchId, String topic, int partition,
+                                  byte[] key, List<?> payloads) throws IOException {
+        return produceBatch(producer, batchId, topic, partition, key, payloads);
+    }
+
+    public BatchReceipt sendBatch(String producer, long batchId, String topic, int partition,
+                                  List<?> keys, List<?> payloads) throws IOException {
+        return produceBatch(producer, batchId, topic, partition, keys, payloads);
+    }
+
+    public BatchReceipt sendBatch(Object request) throws IOException {
+        return produceBatch(request);
+    }
+
+    public BatchReceipt produceBatch(Object request) throws IOException {
+        if (request instanceof tidemq.ingress.ProducerBatch batch) {
+            Object id = batch.batchId();
+            if (id instanceof Number number) {
+                return produceBatch(batch.producer(), number.longValue(), batch.topic(),
+                        batch.partition(), batch.items());
+            }
+            if (id instanceof String text) {
+                return produceBatch(batch.producer(), tidemq.ingress.TideBatchIds.surrogate(text),
+                        batch.topic(), batch.partition(), batch.items());
+            }
+        }
+        throw new BrokerException(BrokerException.Code.BAD_REQUEST, "unsupported batch request type");
+    }
+
+    public BatchReceipt publishBatch(Object request) throws IOException {
+        return produceBatch(request);
     }
 
     public GroupEpoch join(Member member, Set<String> topics) throws IOException {

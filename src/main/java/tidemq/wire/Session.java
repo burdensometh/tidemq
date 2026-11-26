@@ -97,6 +97,7 @@ final class Session {
                 yield EMPTY;
             }
             case PRODUCE -> produce(body);
+            case PRODUCE_BATCH -> produceBatch(body);
             case JOIN -> join(body);
             case ASSIGN -> {
                 expectEmpty(body);
@@ -172,6 +173,24 @@ final class Session {
         var receipt = broker.produce(produce.producer(), produce.sequence(), produce.topic(),
                 produce.partition(), produce.key(), produce.value());
         return Binary.encode(out -> WireValues.writeReceipt(out, receipt));
+    }
+
+    private byte[] produceBatch(byte[] body) throws IOException {
+        WireValues.DecodedBatch decoded;
+        try {
+            decoded = WireValues.readBatchRequestFlexible(
+                    body, settings.messageBytes(), settings.maxBatch());
+        } catch (IOException | IllegalArgumentException malformed) {
+            throw new BrokerException(BrokerException.Code.BAD_REQUEST, "malformed batch request body");
+        }
+        var batch = decoded.publication();
+        var receipt = broker.produceBatch(batch.producer(), batch.batchId(), batch.topic(),
+                batch.partition(), batch.items());
+        if (decoded.textualId()) {
+            return Binary.encode(out ->
+                    WireValues.writeStringBatchReceipt(out, decoded.textualBatchId(), receipt));
+        }
+        return Binary.encode(out -> WireValues.writeBatchReceipt(out, receipt));
     }
 
     private byte[] join(byte[] body) throws IOException {

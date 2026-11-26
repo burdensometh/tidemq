@@ -24,7 +24,7 @@ public final class Segment {
 
     private final TopicPartition partition;
     private final RecordFile file;
-    private final Index index;
+    private Index index;
 
     private Segment(TopicPartition partition, RecordFile file, Index index) {
         this.partition = partition;
@@ -82,6 +82,22 @@ public final class Segment {
         long position = file.append(body, () -> boundary.reached(Boundary.Point.SEGMENT_BEFORE_FORCE));
         index.add(position, message);
         boundary.reached(Boundary.Point.SEGMENT_AFTER_FORCE);
+    }
+
+    /**
+     * Transaction recovery entry point. Truncates this segment at the first
+     * record occupying {@code offset}, then rebuilds its offset index.
+     */
+    void truncateTo(long offset) throws IOException {
+        if (offset < baseOffset() || offset > endOffset()) {
+            throw new IOException("truncate offset " + offset + " outside segment "
+                    + baseOffset() + ".." + endOffset());
+        }
+        long position = offset == endOffset() ? file.size() : index.position(offset);
+        file.truncate(position);
+        index = new Index(baseOffset());
+        file.forEach((recordPosition, body) ->
+                index.add(recordPosition, decode(body, partition)));
     }
 
     Message get(long offset) throws IOException {
