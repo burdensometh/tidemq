@@ -11,6 +11,8 @@ import java.util.Locale;
 import java.util.function.LongSupplier;
 
 public final class Segment {
+    private static final System.Logger LOG = System.getLogger(Segment.class.getName());
+
     public static final int MAGIC = 0x544D5347; // TMSG
     static final String EXTENSION = ".seg";
 
@@ -42,6 +44,54 @@ public final class Segment {
     }
 
     public static Segment open(Path path, TopicPartition partition, boolean repairTail) throws IOException {
+        long base = baseFromName(path);
+        var index = new Index(base);
+        RecordFile file = RecordFile.open(path, MAGIC, base, repairTail,
+                (position, body) -> index.add(position, decode(body, partition)));
+        return new Segment(partition, file, index);
+    }
+
+    /**
+     * Opens a sealed segment, preferring its persisted offset index over a full
+     * record scan. A missing, damaged or disagreeing index falls back to the v1
+     * scan; when {@code upgrade} is set the rebuilt index is then persisted so
+     * later restarts can skip the scan.
+     */
+    static Segment openSealed(Path path, TopicPartition partition, boolean upgrade) throws IOException {
+        long base = baseFromName(path);
+        try {
+            SegmentIndex.Loaded loaded = SegmentIndex.load(path, base);
+            if (loaded != null) {
+                return restore(path, partition, base, loaded);
+            }
+        } catch (IOException invalid) {
+            LOG.log(System.Logger.Level.WARNING, "ignoring segment index for " + path, invalid);
+        }
+        Segment scanned = open(path, partition, false);
+        if (upgrade) {
+            scanned.persistIndex();
+        }
+        return scanned;
+    }
+
+    private static Segment restore(Path path, TopicPartition partition, long base, SegmentIndex.Loaded loaded)
+            throws IOException {
+        RecordFile file = RecordFile.openHeader(path, MAGIC, base);
+        if (loaded.segmentCreatedMs() != file.header().createdAtMs() || loaded.segmentBytes() != file.size()) {
+            throw new IOException("persisted segment index disagrees with segment file");
+        }
+        long[] positions = loaded.positions();
+        var segment = new Segment(partition, file, Index.restored(base, loaded.latestAppendMs(), positions));
+        segment.get(base);
+        Message last = segment.get(segment.endOffset() - 1);
+        if (positions[positions.length - 1] + RecordFile.RECORD_OVERHEAD
+                + MessageV1.wireBodyBytes(last) != file.size()) {
+            throw new IOException("persisted segment index does not cover the whole segment");
+        }
+        return segment;
+    }
+
+    private static long baseFromName(Path path) throws IOException {
         String name = path.getFileName().toString();
         if (name.length() != 24 || !name.endsWith(EXTENSION)) {
             throw new IOException("invalid segment name " + name);
@@ -55,10 +105,7 @@ public final class Segment {
         if (base < 0 || !name.equals(fileName(base))) {
             throw new IOException("noncanonical segment name " + name);
         }
-        var index = new Index(base);
-        RecordFile file = RecordFile.open(path, MAGIC, base, repairTail,
-                (position, body) -> index.add(position, decode(body, partition)));
-        return new Segment(partition, file, index);
+        return base;
     }
 
     private static Message decode(byte[] body, TopicPartition partition) throws IOException {
@@ -116,7 +163,13 @@ public final class Segment {
 
     void remove() throws IOException {
         Files.delete(file.path());
+        Files.deleteIfExists(SegmentIndex.pathFor(file.path()));
         Disk.forceDirectory(file.path().getParent());
+    }
+
+    void persistIndex() throws IOException {
+        SegmentIndex.write(file.path(), baseOffset(), file.header().createdAtMs(), index.latest,
+                file.size(), index.positions, index.count);
     }
 
     private static final class Index {
@@ -127,6 +180,14 @@ public final class Segment {
 
         Index(long base) {
             this.base = base;
+        }
+
+        static Index restored(long base, long latest, long[] positions) {
+            var restored = new Index(base);
+            restored.positions = positions;
+            restored.count = positions.length;
+            restored.latest = latest;
+            return restored;
         }
 
         void add(long position, Message message) throws IOException {

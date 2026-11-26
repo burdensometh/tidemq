@@ -52,6 +52,7 @@ final class PartitionLog {
         }
         Message message = new Message(partition, offset, now, producer, sequence, key, value);
         if (!active.canFit(message, segmentBytes)) {
+            active.persistIndex();
             active = createSegment(offset, now);
         }
         active.append(message, boundary);

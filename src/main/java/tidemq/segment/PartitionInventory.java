@@ -37,7 +37,12 @@ public final class PartitionInventory {
         for (int i = 0; i < paths.size(); i++) {
             Path path = paths.get(i);
             boolean last = i == paths.size() - 1;
-            Segment segment = Segment.open(path, partition, last && repairLast);
+            // Only the broker (repairLast) may open sealed segments through their
+            // persisted index; offline verification always replays every record.
+            // The active tail is always scanned so an incomplete record is repaired.
+            Segment segment = last || !repairLast
+                    ? Segment.open(path, partition, last && repairLast)
+                    : Segment.openSealed(path, partition, true);
             if (previous != null && previous.endOffset() != segment.baseOffset()) {
                 throw new IOException("segment offset gap in " + partition + " between "
                         + previous.endOffset() + " and " + segment.baseOffset());

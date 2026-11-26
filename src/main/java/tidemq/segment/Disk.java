@@ -19,8 +19,12 @@ public final class Disk {
     }
 
     public static int checksum(byte[] bytes) {
+        return checksum(bytes, 0, bytes.length);
+    }
+
+    public static int checksum(byte[] bytes, int offset, int length) {
         CRC32C crc = new CRC32C();
-        crc.update(bytes, 0, bytes.length);
+        crc.update(bytes, offset, length);
         return (int) crc.getValue();
     }
 

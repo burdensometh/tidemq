@@ -39,7 +39,7 @@ Java 客户端提供 `TideClient` 的底层操作，也提供 `ResumableProducer
 - 仅回收连续的已封口前缀段。段右端必须不大于所有订阅组的最小连续水位，且达到配置的最短保留年龄。离线组仍参与。无订阅组时使用分区结束偏移。回收永远保留活跃段，并保留独立存储的生产和死信回执。
 - `delivery.max.batch` 限制每条批操作的记录数。`delivery.max.inflight` 限制每成员的同时预留及已接受租约总数。`delivery.window` 限制水位之后每分区可探测的偏移范围。帧预算会进一步限制 PULL 或死信查询返回行数。
 - `segment.bytes` 改变未来滚段阈值。话题及分区拓扑落盘后固定。重试阈值取进程使用的配置，重启时会重判已丢失活跃租约且达到阈值的条目。
-- 物理存储发生写入或持久边界异常时，代理报告 `STORAGE_FAILURE`，并要求重启以恢复索引。v1 能修复活跃段或日志最后一个物理长度不足的记录，完整记录校验失败会拒绝打开。
+- 物理存储发生写入或持久边界异常时，代理报告 `STORAGE_FAILURE`，并要求重启以恢复索引。v1 能修复活跃段或日志最后一个物理长度不足的记录，完整记录校验失败会拒绝打开。封口段的偏移索引持久化为同目录 `<base>.idx`，仅作启动加速提示：缺失、损坏或与段不一致时回退到完整记录扫描，活跃段始终按记录扫描，离线校验忽略索引文件。
 
 配置位于 [config/broker.properties](config/broker.properties)。当前版本将业务转移和磁盘提交串行化，TCP 连接使用有上限的虚拟线程。协议面向同一主机内的受信客户端。生产回执索引与死信历史随独立日志增长。持久离线组会阻挡保留期限到期的段，规划数据卷时要计入这一行为。
 
@@ -61,7 +61,7 @@ bash scripts/bench.sh 1024
 | 职责 | 入口 |
 | --- | --- |
 | 生产、路由和收据 | `ingress/Ingress`、`ingress/ReceiptIndex` |
-| 段、偏移索引与回收 | `segment/SegmentStore`、`segment/PartitionLog`、`segment/RecordFile` |
+| 段、偏移索引与回收 | `segment/SegmentStore`、`segment/PartitionLog`、`segment/RecordFile`、`segment/SegmentIndex` |
 | 成员代、分配和水位 | `group/GroupDirectory`、`group/GroupStore`、`group/AckFrontier` |
 | 流量窗口、接受和确认 | `delivery/DeliveryEngine`、`delivery/LeaseBook` |
 | 死信与幂等恢复 | `deadletter/DeadLetters`、`delivery/DeliveryEngine.recover` |

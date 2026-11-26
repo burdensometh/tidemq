@@ -2,6 +2,9 @@ package tidemq;
 
 import tidemq.delivery.DeliveryLease;
 import tidemq.ingress.Ingress;
+import tidemq.segment.Disk;
+import tidemq.segment.PartitionInventory;
+import tidemq.segment.RecordFile;
 import tidemq.segment.Segment;
 import tidemq.segment.TopicPartition;
 import tidemq.wire.TcpBroker;
@@ -11,7 +14,9 @@ import tidemq.wire.ResumableProducer;
 
 import java.io.EOFException;
 import java.net.InetAddress;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -49,6 +54,11 @@ public final class BrokerTest {
                 new Case("group-before-replace-preserves-prior-epoch", BrokerTest::abortEpoch),
                 new Case("group-commit-before-epoch-reply-reconciled", BrokerTest::recoverEpoch),
                 new Case("blocked-retention-and-reentry-after-advance", BrokerTest::retention),
+                new Case("sealed-index-persisted-reloaded-and-upgraded", BrokerTest::sealedIndex),
+                new Case("torn-stale-or-foreign-index-falls-back-to-scan", BrokerTest::indexFallback),
+                new Case("corrupt-record-rejected-with-or-without-index", BrokerTest::indexCorruptRecord),
+                new Case("retirement-removes-index-and-orphan-is-ignored", BrokerTest::indexRetirement),
+                new Case("segment-index-roundtrip-stale-torn-and-scan-skip", tidemq.segment.SegmentIndexChecks::check),
                 new Case("single-process-lock-and-fixed-routes", BrokerTest::lockAndTopology),
                 new Case("legacy-v1-normal-incomplete-and-corrupt", Fixtures::check));
         List<String> filters = Arrays.asList(selected);
@@ -424,6 +434,164 @@ public final class BrokerTest {
                 long start = client.join("new", "m", ORDERS).number();
                 eq(List.of(6L), offsets(client.pull(start, 5)));
             }
+        }
+    }
+
+    private static void sealedIndex() throws Exception {
+        try (var tmp = new Scratch()) {
+            var time = new Time();
+            var config = settings(tmp.root);
+            Path dir = tmp.root.resolve("segments/orders/0");
+            try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+                seed(client, 7, new byte[1450]);
+                long epoch = client.join("g", "m", ORDERS).number();
+                var batch = client.pull(epoch, 16);
+                eq(List.of(0L, 1L, 2L, 3L, 4L, 5L, 6L), offsets(batch));
+                eq(0L, ack(client, epoch, batch.subList(1, 3)).get(P0));
+                eq(2, client.group("g").frontiers().get(P0).ahead());
+                eq(4, client.partition(P0, 20).segmentCount());
+            }
+            eq(List.of(indexName(0), indexName(2), indexName(4)), indexFiles(dir));
+            byte[] firstIndex = Files.readAllBytes(dir.resolve(indexName(0)));
+            Files.delete(dir.resolve(indexName(0)));
+            try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+                eq(0L, client.group("g").frontiers().get(P0).next());
+                eq(2, client.group("g").frontiers().get(P0).ahead());
+                long epoch = client.join("g", "m", ORDERS).number();
+                var hole = client.pull(epoch, 16);
+                eq(List.of(0L, 3L, 4L, 5L, 6L), offsets(hole));
+                eq(7L, ack(client, epoch, hole).get(P0));
+                eq(List.of(), client.pull(epoch, 16));
+                eq(0L, client.partition(P0, 1).range().retainedFrom());
+                eq(7L, client.partition(P0, 1).range().nextOffset());
+            }
+            check(Files.exists(dir.resolve(indexName(0))),
+                    "startup must persist the rebuilt index for a v1 segment");
+            eq(true, Arrays.equals(firstIndex, Files.readAllBytes(dir.resolve(indexName(0)))));
+            var view = PartitionInventory.verify(dir, P0);
+            eq(0L, view.low());
+            eq(7L, view.end());
+            eq(7L, view.records());
+            eq(4, view.segments().size());
+        }
+    }
+
+    private static void indexFallback() throws Exception {
+        try (var tmp = new Scratch()) {
+            var time = new Time();
+            var config = settings(tmp.root);
+            try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+                seed(client, 7, new byte[1450]);
+            }
+            Path dir = tmp.root.resolve("segments/orders/0");
+            Path index0 = dir.resolve(indexName(0));
+            byte[] valid = Files.readAllBytes(index0);
+
+            // A torn index write is ignored and rebuilt from the segment records.
+            Files.write(index0, Arrays.copyOf(valid, valid.length / 2));
+            reloadAndCheck(config, time, dir, valid);
+
+            // Bit rot in the index is detected by its checksum.
+            byte[] rotten = valid.clone();
+            rotten[20] ^= 1;
+            Files.write(index0, rotten);
+            reloadAndCheck(config, time, dir, valid);
+
+            // A well-formed index pointing at the wrong positions is rejected.
+            byte[] crafted = valid.clone();
+            ByteBuffer.wrap(crafted, 44 + Long.BYTES, Long.BYTES).putLong(RecordFile.HEADER_BYTES + 9);
+            ByteBuffer.wrap(crafted, crafted.length - Integer.BYTES, Integer.BYTES)
+                    .putInt(Disk.checksum(crafted, 0, crafted.length - Integer.BYTES));
+            Files.write(index0, crafted);
+            reloadAndCheck(config, time, dir, valid);
+
+            // An index belonging to another segment is rejected as foreign.
+            Files.copy(dir.resolve(indexName(2)), index0, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            reloadAndCheck(config, time, dir, valid);
+        }
+    }
+
+    private static void reloadAndCheck(Settings config, TestSupport.Time time, Path dir, byte[] validIndex)
+            throws Exception {
+        try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+            eq(0L, client.partition(P0, 1).range().retainedFrom());
+            eq(7L, client.partition(P0, 1).range().nextOffset());
+            check(publish(client, "p", 0, new byte[1450]).replayed(),
+                    "receipt must be reconciled from retained messages");
+            long epoch = client.join("g", "m", ORDERS).number();
+            var reserved = client.reserve(epoch, 16);
+            eq(List.of(0L, 1L, 2L, 3L, 4L, 5L, 6L),
+                    reserved.stream().map(lease -> lease.message().offset()).toList());
+        }
+        check(Files.exists(dir.resolve(indexName(0))), "fallback scan must rebuild the index");
+        eq(true, Arrays.equals(validIndex, Files.readAllBytes(dir.resolve(indexName(0)))));
+        var view = PartitionInventory.verify(dir, P0);
+        eq(0L, view.low());
+        eq(7L, view.end());
+    }
+
+    private static void indexCorruptRecord() throws Exception {
+        try (var tmp = new Scratch()) {
+            var time = new Time();
+            var config = settings(tmp.root);
+            try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+                seed(client, 30, new byte[100]);
+            }
+            Path dir = tmp.root.resolve("segments/orders/0");
+            check(Files.exists(dir.resolve(indexName(0))), "sealed segment index written at roll");
+            Path segment0 = dir.resolve(Segment.fileName(0));
+            byte[] bytes = Files.readAllBytes(segment0);
+            int position = RecordFile.HEADER_BYTES;
+            for (int i = 0; i < 10; i++) {
+                position += RecordFile.RECORD_OVERHEAD + ByteBuffer.wrap(bytes, position, Integer.BYTES).getInt();
+            }
+            int length = ByteBuffer.wrap(bytes, position, Integer.BYTES).getInt();
+            bytes[position + Integer.BYTES + length - 1] ^= 1;
+            Files.write(segment0, bytes);
+            // A valid index must not mask the damaged record: startup refuses to open.
+            io(() -> TcpBroker.start(config, time, Boundary.NONE));
+            io(() -> PartitionInventory.verify(dir, P0));
+            // Without the index the v1 scan rejects the same record.
+            Files.delete(dir.resolve(indexName(0)));
+            io(() -> TcpBroker.start(config, time, Boundary.NONE));
+        }
+    }
+
+    private static void indexRetirement() throws Exception {
+        try (var tmp = new Scratch()) {
+            var time = new Time();
+            var config = settings(tmp.root);
+            Path dir = tmp.root.resolve("segments/orders/0");
+            try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+                seed(client, 7, new byte[1450]);
+                long epoch = client.join("g", "m", ORDERS).number();
+                eq(7L, ack(client, epoch, client.pull(epoch, 16)).get(P0));
+                eq(List.of(indexName(0), indexName(2), indexName(4)), indexFiles(dir));
+                time.advance(1000);
+                eq(3, client.retire());
+                eq(6L, client.partition(P0, 1).range().retainedFrom());
+                eq(List.of(), indexFiles(dir));
+                // A crash between the segment and index deletes leaves an orphan index.
+                Files.write(dir.resolve(indexName(0)), new byte[] {1, 2, 3, 4});
+            }
+            try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+                eq(6L, client.partition(P0, 1).range().retainedFrom());
+                eq(7L, client.partition(P0, 1).range().nextOffset());
+                check(publish(client, "p", 0, new byte[1450]).replayed(), "retired producer receipt was lost");
+                long epoch = client.join("n", "m", ORDERS).number();
+                eq(List.of(6L), offsets(client.pull(epoch, 16)));
+            }
+        }
+    }
+
+    private static String indexName(long base) {
+        return Segment.fileName(base).replace(".seg", ".idx");
+    }
+
+    private static List<String> indexFiles(Path dir) throws Exception {
+        try (var entries = Files.list(dir)) {
+            return entries.map(path -> path.getFileName().toString())
+                    .filter(name -> name.endsWith(".idx")).sorted().toList();
         }
     }
 

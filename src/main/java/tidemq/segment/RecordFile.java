@@ -57,6 +57,23 @@ public final class RecordFile {
         }
     }
 
+    /**
+     * Opens a record file by its header only, trusting the current file size as the
+     * end. Callers must validate the contents through other means (a persisted
+     * segment index) before serving records.
+     */
+    static RecordFile openHeader(Path path, int magic, long expectedBase) throws IOException {
+        try (FileChannel file = FileChannel.open(path, StandardOpenOption.READ)) {
+            Header header = readHeader(file, magic);
+            if (header.baseOffset() != expectedBase) {
+                throw new IOException("record header base offset disagrees with expected base " + expectedBase);
+            }
+            return new RecordFile(path, header, file.size());
+        } catch (IOException error) {
+            throw new IOException("reading " + path + ": " + error.getMessage(), error);
+        }
+    }
+
     private static Header readHeader(FileChannel file, int magic) throws IOException {
         ByteBuffer bytes = Disk.read(file, 0, HEADER_BYTES);
         int observedMagic = bytes.getInt();
