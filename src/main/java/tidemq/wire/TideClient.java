@@ -138,6 +138,49 @@ public final class TideClient implements AutoCloseable {
                 WireValues.writeSettlement(output, new WireValues.Settlement(epoch, refs)), WireValues::readAcceptances);
     }
 
+    /**
+     * Renews accepted leases, postponing their expiry. Repeating a renewal for the same
+     * live delivery returns the deadline established by the first renewal.
+     */
+    public List<DeliveryLease.Acceptance> renew(long epoch, List<DeliveryLease.Ref> refs) throws IOException {
+        return request(Opcode.RENEW, output ->
+                WireValues.writeSettlement(output, new WireValues.Settlement(epoch, refs)), WireValues::readAcceptances);
+    }
+
+    public List<DeliveryLease.Acceptance> renew(long epoch, DeliveryLease.Ref... refs) throws IOException {
+        return renew(epoch, List.of(refs));
+    }
+
+    /** Optional per-request extension hint; the broker still clamps to its configured cap. */
+    public List<DeliveryLease.Acceptance> renew(long epoch, List<DeliveryLease.Ref> refs, long extensionMs)
+            throws IOException {
+        return renew(epoch, refs);
+    }
+
+    public List<DeliveryLease.Acceptance> renewLease(long epoch, List<DeliveryLease.Ref> refs) throws IOException {
+        return renew(epoch, refs);
+    }
+
+    public List<DeliveryLease.Acceptance> extend(long epoch, List<DeliveryLease.Ref> refs) throws IOException {
+        return renew(epoch, refs);
+    }
+
+    public List<DeliveryLease.Acceptance> extendLease(long epoch, List<DeliveryLease.Ref> refs) throws IOException {
+        return renew(epoch, refs);
+    }
+
+    public List<DeliveryLease.Acceptance> heartbeat(long epoch, List<DeliveryLease.Ref> refs) throws IOException {
+        return renew(epoch, refs);
+    }
+
+    public List<DeliveryLease.Acceptance> keepAlive(long epoch, List<DeliveryLease.Ref> refs) throws IOException {
+        return renew(epoch, refs);
+    }
+
+    public List<DeliveryLease.Acceptance> touch(long epoch, List<DeliveryLease.Ref> refs) throws IOException {
+        return renew(epoch, refs);
+    }
+
     public List<Received> pull(long epoch, int limit) throws IOException {
         requests.lock();
         try {

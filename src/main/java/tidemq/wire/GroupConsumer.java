@@ -119,6 +119,41 @@ public final class GroupConsumer implements AutoCloseable {
         return acknowledge(batch, batch.messages());
     }
 
+    /**
+     * Renews every accepted lease in the batch using the connection incarnation and epoch
+     * that received it. A stale batch is rejected before touching the wire.
+     */
+    public List<DeliveryLease.Acceptance> renew(Batch batch) throws IOException {
+        return renew(batch, batch.messages());
+    }
+
+    public List<DeliveryLease.Acceptance> renew(Batch batch, List<TideClient.Received> processed)
+            throws IOException {
+        if (batch.owner != this || !batch.messages().containsAll(processed)) {
+            throw new IllegalArgumentException("deliveries do not belong to this consumer batch");
+        }
+        operation.lock();
+        try {
+            if (closed || client == null || batch.incarnation != incarnation || batch.epoch() != assignment.number()) {
+                throw new BrokerException(BrokerException.Code.STALE_EPOCH,
+                        "batch belongs to an earlier connection or epoch");
+            }
+            if (processed.isEmpty()) {
+                return List.of();
+            }
+            List<DeliveryLease.Ref> refs = processed.stream().map(TideClient.Received::lease)
+                    .map(DeliveryLease::ref).toList();
+            return client.renew(batch.epoch(), refs);
+        } catch (BrokerException rejected) {
+            throw rejected;
+        } catch (IOException transport) {
+            drop(transport);
+            throw new IOException("renewal result unknown for " + group + "/" + member, transport);
+        } finally {
+            operation.unlock();
+        }
+    }
+
     public Map<TopicPartition, Long> acknowledge(Batch batch, List<TideClient.Received> processed)
             throws IOException {
         if (batch.owner != this || !batch.messages().containsAll(processed)) {

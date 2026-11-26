@@ -105,6 +105,7 @@ final class Session {
             }
             case PULL -> pull(body);
             case ACCEPT -> accept(body);
+            case RENEW -> renew(body);
             case ACK -> acknowledge(body);
             case LEAVE -> {
                 expectEmpty(body);
@@ -207,6 +208,15 @@ final class Session {
             throw new BrokerException(BrokerException.Code.CAPACITY, "acceptance receipts exceed negotiated frame");
         }
         var result = broker.accept(requireMember(), settlement.epoch(), settlement.refs());
+        return Binary.encode(out -> WireValues.writeAcceptances(out, result));
+    }
+
+    private byte[] renew(byte[] body) throws IOException {
+        var settlement = read(body, WireValues::readSettlement);
+        if (WireValues.acceptanceSize(settlement.refs()) > room()) {
+            throw new BrokerException(BrokerException.Code.CAPACITY, "renewal receipts exceed negotiated frame");
+        }
+        var result = broker.renew(requireMember(), settlement.epoch(), settlement.refs());
         return Binary.encode(out -> WireValues.writeAcceptances(out, result));
     }
 

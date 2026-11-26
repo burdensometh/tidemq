@@ -21,7 +21,9 @@ final class LeaseBook {
         private final String member;
         private final Slot slot;
         private long activeUntil;
+        private long deadlineCap;
         private boolean accepted;
+        private boolean renewed;
 
         Entry(DeliveryLease lease, long session, String member, Slot slot) {
             this.ref = lease.ref();
@@ -40,17 +42,32 @@ final class LeaseBook {
             return activeUntil;
         }
 
+        long deadlineCap() {
+            return deadlineCap;
+        }
+
         boolean accepted() {
             return accepted;
+        }
+
+        boolean renewed() {
+            return renewed;
         }
 
         String member() {
             return member;
         }
 
-        void accept(long expiresAt) {
+        void accept(long expiresAt, long latestUntil) {
             activeUntil = expiresAt;
+            deadlineCap = latestUntil;
             accepted = true;
+            renewed = false;
+        }
+
+        void renewTo(long expiresAt) {
+            activeUntil = expiresAt;
+            renewed = true;
         }
     }
 

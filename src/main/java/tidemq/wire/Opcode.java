@@ -21,7 +21,8 @@ enum Opcode {
     DEAD_LETTERS(13),
     RETIRE(14),
     RETENTION_PREVIEW(15),
-    FLOW(16);
+    FLOW(16),
+    RENEW(17);
 
     static final int SUCCESS = 0x80;
     static final int ERROR = 0x7f;

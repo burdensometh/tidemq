@@ -222,13 +222,34 @@ public final class DeliveryEngine {
             if (!entry.accepted()) {
                 AckFrontier frontier = group.frontier(ref.partition());
                 frontier.beginAttempt(ref.offset());
-                entry.accept(deadline(now, settings.leaseMs()));
+                entry.accept(deadline(now, settings.leaseMs()), deadline(now, settings.leaseMaxMs()));
                 changed = true;
             }
             result.add(new DeliveryLease.Acceptance(ref, entry.activeUntil()));
         }
         if (changed) {
             groups.saveProgress(group);
+        }
+        return List.copyOf(result);
+    }
+
+    public List<DeliveryLease.Acceptance> renew(GroupEpoch epoch, long session, List<DeliveryLease.Ref> refs, long now)
+            throws IOException {
+        GroupState group = groups.require(epoch.group());
+        LeaseBook book = requireBook(epoch);
+        expire(group, book, now);
+        List<LeaseBook.Entry> entries = resolve(book, epoch, session, refs);
+        var result = new ArrayList<DeliveryLease.Acceptance>(entries.size());
+        for (LeaseBook.Entry entry : entries) {
+            if (!entry.accepted()) {
+                throw new BrokerException(BrokerException.Code.UNKNOWN_LEASE,
+                        "accept delivery before renewing its lease");
+            }
+            if (!entry.renewed()) {
+                long extended = deadline(now, settings.leaseMs());
+                entry.renewTo(Math.min(extended, entry.deadlineCap()));
+            }
+            result.add(new DeliveryLease.Acceptance(entry.ref(), entry.activeUntil()));
         }
         return List.copyOf(result);
     }

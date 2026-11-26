@@ -117,6 +117,11 @@ public final class Broker implements AutoCloseable {
         return run(() -> delivery.accept(checkEpoch(member, epoch), member.session(), refs, now()));
     }
 
+    public List<DeliveryLease.Acceptance> renew(Member member, long epoch, List<DeliveryLease.Ref> refs)
+            throws IOException {
+        return run(() -> delivery.renew(checkEpoch(member, epoch), member.session(), refs, now()));
+    }
+
     public Map<TopicPartition, Long> ack(Member member, long epoch, List<DeliveryLease.Ref> refs)
             throws IOException {
         return run(() -> delivery.ack(checkEpoch(member, epoch), member.session(), refs, now()));
