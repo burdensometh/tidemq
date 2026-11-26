@@ -26,12 +26,19 @@ public final class GroupDirectory {
     private final GroupStore store;
     private final int maxMembers;
     private final Map<String, GroupState> groups = new TreeMap<>();
+    private final RetentionIndex retention;
 
     public GroupDirectory(Settings settings, SegmentStore segments, Boundary boundary) throws IOException {
         this.segments = segments;
         this.maxMembers = settings.maxMembers();
         this.store = new GroupStore(settings.dataDirectory().resolve("groups"), boundary, segments);
-        store.load(MAX_GROUPS).forEach(group -> groups.put(group.name(), group));
+        var loaded = new java.util.ArrayList<GroupState>();
+        store.load(MAX_GROUPS).forEach(group -> {
+            groups.put(group.name(), group);
+            loaded.add(group);
+        });
+        retention = new RetentionIndex(segments);
+        retention.rebuild(loaded);
     }
 
     public GroupEpoch join(String name, String member, long session, Set<String> subscriptions) throws IOException {
@@ -49,6 +56,8 @@ public final class GroupDirectory {
                 throw new BrokerException(BrokerException.Code.CAPACITY, "durable group limit reached");
             }
             group = createGroup(name, subscriptions);
+            groups.put(name, group);
+            retention.register(group);
         } else if (!group.subscriptions().equals(subscriptions)) {
             throw new BrokerException(BrokerException.Code.GROUP_CONFLICT, "group subscriptions are immutable");
         }
@@ -120,36 +129,33 @@ public final class GroupDirectory {
                 Collections.unmodifiableMap(frontiers));
     }
 
-    public Map<TopicPartition, Long> retentionFrontiers() throws BrokerException {
-        var minimums = new TreeMap<TopicPartition, Long>();
-        for (TopicPartition partition : segments.partitions()) {
-            minimums.put(partition, segments.range(partition).nextOffset());
-        }
-        for (GroupState group : groups.values()) {
-            group.frontiers().forEach((partition, frontier) -> minimums.merge(partition, frontier.next(), Math::min));
-        }
-        return minimums;
+    /**
+     * Records a contiguous watermark advance on one partition. Only the partition linked to the
+     * advancing group is touched; groups whose watermarks did not move are never revisited.
+     */
+    public void watermarkAdvanced(GroupState group, TopicPartition partition, long watermark)
+            throws BrokerException {
+        retention.advance(group, partition, watermark);
+    }
+
+    /**
+     * Frontiers of the partitions whose cached barrier changed since the last drain. An explicit
+     * retention pass therefore evaluates only partitions associated with observed group progress.
+     */
+    public Map<TopicPartition, Long> drainRetentionFrontiers() {
+        return retention.drainDirty();
+    }
+
+    /** Cached frontiers for the periodic sweep: every partition, but no per-group traversal. */
+    public Map<TopicPartition, Long> allRetentionFrontiers() throws BrokerException {
+        return retention.allFrontiers();
     }
 
     public RetentionBarrier retentionBarrier(TopicPartition partition) throws BrokerException {
-        long minimum = segments.range(partition).nextOffset();
-        int groupCount = 0;
-        var names = new java.util.ArrayList<String>(8);
-        for (GroupState group : groups.values()) {
-            AckFrontier frontier = group.frontier(partition);
-            if (frontier == null || frontier.next() > minimum) {
-                continue;
-            }
-            if (frontier.next() < minimum) {
-                names.clear();
-                groupCount = 0;
-                minimum = frontier.next();
-            }
-            groupCount++;
-            if (names.size() < 8) {
-                names.add(group.name());
-            }
-        }
-        return new RetentionBarrier(minimum, groupCount, List.copyOf(names));
+        return retention.barrier(partition, 8);
+    }
+
+    public RetentionStats retentionStats() {
+        return retention.stats();
     }
 }

@@ -35,6 +35,7 @@ public final class DeliveryEngine {
 
     public void recover(long now) throws IOException {
         var changed = new HashSet<GroupState>();
+        var advanced = new HashMap<GroupState, List<Map.Entry<TopicPartition, Long>>>();
         deadLetters.forEach(receipt -> {
             GroupState group = groups.require(receipt.group());
             Message message = receipt.message();
@@ -46,21 +47,35 @@ public final class DeliveryEngine {
                 if (frontier.attempts(message.offset()) != receipt.attempts()) {
                     throw new IOException("dead-letter attempts disagree with group checkpoint");
                 }
-                frontier.complete(message.offset());
+                long before = frontier.complete(message.offset());
                 changed.add(group);
+                if (frontier.next() != before) {
+                    advanced.computeIfAbsent(group, key -> new ArrayList<>())
+                            .add(Map.entry(message.partition(), frontier.next()));
+                }
             }
         });
         for (GroupState group : groups.states()) {
             for (TopicPartition partition : group.partitions()) {
                 AckFrontier frontier = group.frontier(partition);
                 for (long offset : frontier.exhausted(settings.maxAttempts())) {
-                    terminal(group, partition, offset, now);
+                    long watermark = terminal(group, partition, offset, now);
                     changed.add(group);
+                    if (watermark >= 0) {
+                        advanced.computeIfAbsent(group, key -> new ArrayList<>())
+                                .add(Map.entry(partition, watermark));
+                    }
                 }
             }
         }
         for (GroupState group : changed) {
             groups.saveProgress(group);
+        }
+        for (var entry : advanced.entrySet()) {
+            GroupState group = entry.getKey();
+            for (Map.Entry<TopicPartition, Long> move : entry.getValue()) {
+                groups.watermarkAdvanced(group, move.getKey(), move.getValue());
+            }
         }
     }
 
@@ -128,24 +143,32 @@ public final class DeliveryEngine {
 
     private void dispose(GroupState group, LeaseBook book, List<LeaseBook.Entry> expired, long now) throws IOException {
         boolean advanced = false;
+        var watermarkMoves = new ArrayList<Map.Entry<TopicPartition, Long>>();
         for (LeaseBook.Entry entry : expired) {
             var ref = entry.ref();
             if (entry.accepted() && group.frontier(ref.partition()).attempts(ref.offset()) >= settings.maxAttempts()) {
-                terminal(group, ref.partition(), ref.offset(), now);
+                long watermark = terminal(group, ref.partition(), ref.offset(), now);
                 advanced = true;
+                if (watermark >= 0) {
+                    watermarkMoves.add(Map.entry(ref.partition(), watermark));
+                }
             }
             book.remove(entry);
         }
         if (advanced) {
             groups.saveProgress(group);
+            for (Map.Entry<TopicPartition, Long> move : watermarkMoves) {
+                groups.watermarkAdvanced(group, move.getKey(), move.getValue());
+            }
         }
     }
 
-    private void terminal(GroupState group, TopicPartition partition, long offset, long now) throws IOException {
+    private long terminal(GroupState group, TopicPartition partition, long offset, long now) throws IOException {
         AckFrontier frontier = group.frontier(partition);
         Message message = segments.read(partition, offset);
         deadLetters.archive(group.name(), message, frontier.attempts(offset), now);
-        frontier.complete(offset);
+        long before = frontier.complete(offset);
+        return frontier.next() == before ? -1L : frontier.next();
     }
 
     public List<DeliveryLease> pull(GroupEpoch epoch, long session, int limit, int byteBudget, long now)
@@ -245,13 +268,21 @@ public final class DeliveryEngine {
             }
         }
         var touched = new java.util.TreeSet<TopicPartition>();
+        var advanced = new java.util.ArrayList<Map.Entry<TopicPartition, Long>>();
         for (LeaseBook.Entry entry : entries) {
             var ref = entry.ref();
-            group.frontier(ref.partition()).complete(ref.offset());
+            AckFrontier frontier = group.frontier(ref.partition());
+            long before = frontier.complete(ref.offset());
+            if (frontier.next() != before) {
+                advanced.add(Map.entry(ref.partition(), frontier.next()));
+            }
             touched.add(ref.partition());
             book.remove(entry);
         }
         groups.saveProgress(group);
+        for (Map.Entry<TopicPartition, Long> change : advanced) {
+            groups.watermarkAdvanced(group, change.getKey(), change.getValue());
+        }
         var result = new java.util.TreeMap<TopicPartition, Long>();
         touched.forEach(partition -> result.put(partition, group.frontier(partition).next()));
         return result;

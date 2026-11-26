@@ -154,6 +154,19 @@ public final class Broker implements AutoCloseable {
         return run(() -> retire(now()));
     }
 
+    /**
+     * Full age sweep over every partition, the same work the periodic maintenance thread performs
+     * when the retention interval elapses. Exposed for tests that must prove age-driven reclaim on
+     * partitions whose group barrier did not move.
+     */
+    public int sweepRetention() throws IOException {
+        return run(() -> sweepRetention(now()));
+    }
+
+    public tidemq.group.RetentionStats retentionStats() throws IOException {
+        return run(groups::retentionStats);
+    }
+
     public RetentionPreview previewRetention(TopicPartition partition) throws IOException {
         return run(() -> {
             var barrier = groups.retentionBarrier(partition);
@@ -161,12 +174,25 @@ public final class Broker implements AutoCloseable {
         });
     }
 
+    /**
+     * Explicit retention pass: only partitions linked to group watermark advances observed since
+     * the previous pass are re-evaluated, so the cost tracks changed associations instead of the
+     * number of durable (and possibly offline) groups.
+     */
     private int retire(long now) throws IOException {
+        return retireFrontiers(groups.drainRetentionFrontiers(), now);
+    }
+
+    /** Periodic sweep over every partition for segment age, using cached per-partition barriers. */
+    private int sweepRetention(long now) throws IOException {
+        return retireFrontiers(groups.allRetentionFrontiers(), now);
+    }
+
+    private int retireFrontiers(Map<TopicPartition, Long> frontiers, long now) throws IOException {
         int retired = 0;
-        for (var entry : groups.retentionFrontiers().entrySet()) {
+        for (var entry : frontiers.entrySet()) {
             retired += segments.retire(entry.getKey(), entry.getValue(), now);
         }
-        lastRetention = now;
         return retired;
     }
 
@@ -175,7 +201,8 @@ public final class Broker implements AutoCloseable {
             long now = now();
             delivery.sweep(now);
             if (now - lastRetention >= settings.retentionIntervalMs()) {
-                retire(now);
+                sweepRetention(now);
+                lastRetention = now;
             }
             return null;
         });

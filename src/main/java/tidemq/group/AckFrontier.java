@@ -44,19 +44,26 @@ public final class AckFrontier {
         return count;
     }
 
-    public void complete(long offset) {
+    /**
+     * Completes the offset and returns the contiguous watermark in effect before the call.
+     * The returned value equals {@link #next()} after the call exactly when the contiguous
+     * watermark did not advance (an out-of-order completion above a still-open hole).
+     */
+    public long complete(long offset) {
+        long before = next;
         if (isComplete(offset)) {
-            return;
+            return before;
         }
         attempts.remove(offset);
         if (offset != next) {
             completed.add(offset);
-            return;
+            return before;
         }
         next++;
         while (completed.remove(next)) {
             next++;
         }
+        return before;
     }
 
     NavigableSet<Long> completedAhead() {
