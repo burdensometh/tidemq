@@ -31,11 +31,17 @@ public record Settings(
         long reservationMs,
         int maxAttempts,
         long retentionAgeMs,
-        long retentionIntervalMs) {
+        long retentionIntervalMs,
+        long retryBackoffMs,
+        long retryBackoffMaxMs) {
     public static final int MAX_IDENTIFIER = 64;
     public static final int MAX_KEY_BYTES = 256;
     public static final int MIN_FRAME_BYTES = 1024;
     public static final int MAX_FRAME_BYTES = 64 * 1024 * 1024;
+    public static final long DEFAULT_RETRY_BACKOFF_MS = 1000;
+    public static final long DEFAULT_RETRY_BACKOFF_MAX_MS = 30_000;
+    private static final String RETRY_BACKOFF_KEY = "delivery.retry.backoff.ms";
+    private static final String RETRY_BACKOFF_MAX_KEY = "delivery.retry.backoff.max.ms";
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_-]{0,63}");
     private static final Set<String> KEYS = Set.of(
             "listen.host", "listen.port", "data.directory", "topics",
@@ -43,7 +49,20 @@ public record Settings(
             "session.max.connections", "session.read.timeout.ms", "group.max.members",
             "delivery.max.batch", "delivery.max.inflight", "delivery.window",
             "delivery.lease.ms", "delivery.reservation.ms", "delivery.max.attempts",
+            "delivery.retry.backoff.ms", "delivery.retry.backoff.max.ms",
             "retention.min.age.ms", "retention.interval.ms");
+
+    public Settings(InetAddress address, int port, Path dataDirectory, Map<String, Integer> topics,
+                    int segmentBytes, int messageBytes, int frameBytes,
+                    int maxConnections, int readTimeoutMs, int maxMembers,
+                    int maxBatch, int maxInflight, int deliveryWindow,
+                    long leaseMs, long reservationMs, int maxAttempts,
+                    long retentionAgeMs, long retentionIntervalMs) {
+        this(address, port, dataDirectory, topics, segmentBytes, messageBytes, frameBytes,
+                maxConnections, readTimeoutMs, maxMembers, maxBatch, maxInflight, deliveryWindow,
+                leaseMs, reservationMs, maxAttempts, retentionAgeMs, retentionIntervalMs,
+                DEFAULT_RETRY_BACKOFF_MS, DEFAULT_RETRY_BACKOFF_MAX_MS);
+    }
 
     public Settings {
         topics = Collections.unmodifiableMap(new TreeMap<>(topics));
@@ -72,11 +91,35 @@ public record Settings(
         range("delivery.lease.ms", leaseMs, 1, 86_400_000);
         range("delivery.reservation.ms", reservationMs, 1, 86_400_000);
         range("delivery.max.attempts", maxAttempts, 1, 1000);
+        range("delivery.retry.backoff.ms", retryBackoffMs, 0, 31_536_000_000L);
+        range("delivery.retry.backoff.max.ms", retryBackoffMaxMs, 0, 31_536_000_000L);
+        if (retryBackoffMs > 0 && retryBackoffMaxMs < retryBackoffMs) {
+            throw new IllegalArgumentException("delivery.retry.backoff.max.ms must be at least the base backoff");
+        }
         range("retention.min.age.ms", retentionAgeMs, 0, 31_536_000_000L);
         range("retention.interval.ms", retentionIntervalMs, 10, 3_600_000);
         if (messageBytes + 1024 > Math.min(segmentBytes, frameBytes)) {
             throw new IllegalArgumentException("message.max.bytes requires 1024 bytes of segment and frame overhead");
         }
+    }
+
+    /**
+     * Delay before a message whose {@code consumedAttempts}-th accepted delivery was lost may be
+     * reserved again. The delay doubles per consumed attempt and is capped, so a nonpositive base
+     * disables retry backoff.
+     */
+    public long retryDelay(int consumedAttempts) {
+        if (consumedAttempts < 1 || retryBackoffMs <= 0) {
+            return 0;
+        }
+        long delay = retryBackoffMs;
+        // Loop at most 1000 times (the maximum configured attempt count), regardless of the
+        // supplied value, and stop as soon as the cap is reached.
+        int steps = Math.min(consumedAttempts, 1000);
+        for (int attempt = 1; attempt < steps && delay < retryBackoffMaxMs; attempt++) {
+            delay = Math.min(delay * 2, retryBackoffMaxMs);
+        }
+        return Math.min(delay, retryBackoffMaxMs);
     }
 
     public static Settings load(Path path) throws IOException {
@@ -107,7 +150,9 @@ public record Settings(
                 wideNumber(p, "delivery.reservation.ms", 3000),
                 number(p, "delivery.max.attempts", 3),
                 wideNumber(p, "retention.min.age.ms", 60_000),
-                wideNumber(p, "retention.interval.ms", 5000));
+                wideNumber(p, "retention.interval.ms", 5000),
+                wideNumber(p, RETRY_BACKOFF_KEY, DEFAULT_RETRY_BACKOFF_MS),
+                wideNumber(p, RETRY_BACKOFF_MAX_KEY, DEFAULT_RETRY_BACKOFF_MAX_MS));
     }
 
     private static Map<String, Integer> parseTopics(String value) {

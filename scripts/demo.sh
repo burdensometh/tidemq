@@ -21,6 +21,8 @@ segment.bytes=4096
 message.max.bytes=2048
 delivery.lease.ms=750
 delivery.max.attempts=2
+delivery.retry.backoff.ms=500
+delivery.retry.backoff.max.ms=4000
 retention.min.age.ms=0
 retention.interval.ms=60000
 EOF

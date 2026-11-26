@@ -32,7 +32,17 @@ final class TestSupport {
     static Settings settings(Path root, Map<String, Integer> topics, long age) {
         return new Settings(InetAddress.getLoopbackAddress(), 0, root, topics,
                 4096, 2048, 64 * 1024, 64, 10_000, 16,
-                16, 32, 128, 1000, 300, 2, age, 60_000);
+                16, 32, 128, 1000, 300, 2, age, 60_000, 0, 0);
+    }
+
+    static Settings settings(Path root, long retryBackoffMs, long retryBackoffMaxMs) {
+        return settings(root, retryBackoffMs, retryBackoffMaxMs, 3);
+    }
+
+    static Settings settings(Path root, long retryBackoffMs, long retryBackoffMaxMs, int maxAttempts) {
+        return new Settings(InetAddress.getLoopbackAddress(), 0, root, Map.of("orders", 1),
+                4096, 2048, 64 * 1024, 64, 10_000, 16,
+                16, 32, 128, 1000, 300, maxAttempts, 1000, 60_000, retryBackoffMs, retryBackoffMaxMs);
     }
 
     static TideClient connect(TcpBroker server) throws IOException {

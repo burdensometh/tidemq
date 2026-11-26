@@ -83,7 +83,9 @@ public final class BrokerDemo {
         batchB.forEach(received -> printDelivery("work", "b", received));
         BrokerTest.ack(b, second.number(), batchB);
         waitFor(poison.expiresAtMs());
-        var retry = a.pull(current.number(), 16);
+        // The failed head of partition 0 is retried only after its backoff elapses; poll until
+        // it becomes available instead of assuming expiry alone makes it immediately readable.
+        var retry = awaitDelivery(a, current.number(), 16);
         eq(1, retry.size());
         eq(2, retry.getFirst().lease().attempt());
         printDelivery("work", "a", retry.getFirst());
@@ -121,6 +123,19 @@ public final class BrokerDemo {
 
     private static void waitFor(long deadline) throws InterruptedException {
         Thread.sleep(Math.max(0, deadline - System.currentTimeMillis()) + 30);
+    }
+
+    private static List<TideClient.Received> awaitDelivery(TideClient client, long epoch, int limit)
+            throws Exception {
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (System.currentTimeMillis() < deadline) {
+            var batch = client.pull(epoch, limit);
+            if (!batch.isEmpty()) {
+                return batch;
+            }
+            Thread.sleep(50);
+        }
+        throw new AssertionError("delivery did not become available within the retry backoff window");
     }
 
     private static void printDelivery(String group, String member, TideClient.Received item) {

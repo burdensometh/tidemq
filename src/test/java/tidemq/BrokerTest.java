@@ -44,11 +44,20 @@ public final class BrokerTest {
                 new Case("frame-budget-does-not-create-lease", BrokerTest::smallFrame),
                 new Case("accept-is-idempotent-with-fixed-deadline", BrokerTest::idempotentAccept),
                 new Case("lease-timeout-retries-and-terminal-delivery", BrokerTest::retry),
+                new Case("retry-backoff-delays-redelivery-by-consumed-attempts", BrokerTest::retryBackoff),
+                new Case("retry-backoff-waiting-offset-does-not-block-window", BrokerTest::waitingDoesNotBlockWindow),
+                new Case("retry-backoff-survives-reconnect-and-epoch-change", BrokerTest::backoffSurvivesReconnect),
+                new Case("retry-backoff-survives-connection-drop", BrokerTest::backoffSurvivesMidLeaseDisconnect),
+                new Case("retry-backoff-survives-restart-without-shortening", BrokerTest::backoffSurvivesRestart),
+                new Case("reservation-expiry-does-not-backoff", BrokerTest::reservationNoBackoff),
+                new Case("terminal-dead-letter-still-follows-backoff", BrokerTest::terminalAfterBackoff),
                 new Case("dead-letter-before-force-reconciled", () -> recoverDeadLetter(Boundary.Point.DEADLETTER_BEFORE_FORCE)),
                 new Case("dead-letter-force-before-frontier-reconciled", () -> recoverDeadLetter(Boundary.Point.DEADLETTER_AFTER_FORCE)),
                 new Case("group-before-replace-preserves-prior-epoch", BrokerTest::abortEpoch),
                 new Case("group-commit-before-epoch-reply-reconciled", BrokerTest::recoverEpoch),
                 new Case("blocked-retention-and-reentry-after-advance", BrokerTest::retention),
+                new Case("legacy-v1-group-snapshot-loads", BrokerTest::legacyGroupSnapshot),
+                new Case("retry-backoff-configuration", BrokerTest::retryBackoffConfig),
                 new Case("single-process-lock-and-fixed-routes", BrokerTest::lockAndTopology),
                 new Case("legacy-v1-normal-incomplete-and-corrupt", Fixtures::check));
         List<String> filters = Arrays.asList(selected);
@@ -301,6 +310,215 @@ public final class BrokerTest {
         }
     }
 
+    private static void retryBackoff() throws Exception {
+        var time = new Time();
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, 100, 250), time, Boundary.NONE);
+             var client = connect(server)) {
+            publish(client, "p", 0, bytes("backoff"));
+            long epoch = client.join("g", "m", ORDERS).number();
+            var first = client.pull(epoch, 1);
+            eq(1, first.getFirst().lease().attempt());
+            // Accepting starts the lease; no reservation-only attempt is charged yet.
+            time.advance(1000);
+            // The consumed accepted attempt anchors a 100ms backoff at the lease deadline.
+            eq(List.of(), client.pull(epoch, 1));
+            eq(1, client.group("g").frontiers().get(P0).retrying());
+            time.advance(99);
+            eq(List.of(), client.pull(epoch, 1));
+            time.advance(1);
+            var second = client.pull(epoch, 1);
+            eq(2, second.getFirst().lease().attempt());
+            time.advance(1000);
+            eq(List.of(), client.pull(epoch, 1));
+            // A second consumed attempt doubles the base delay to 200ms.
+            time.advance(199);
+            eq(List.of(), client.pull(epoch, 1));
+            time.advance(1);
+            var third = client.pull(epoch, 1);
+            eq(3, third.getFirst().lease().attempt());
+            // The third attempt reaches the configured maximum; its loss is terminal at once,
+            // with no backoff, exactly as before the feature.
+            time.advance(1000);
+            eq(List.of(), client.pull(epoch, 1));
+            var page = client.deadLetters("g", 0, 4);
+            eq(1, page.receipts().size());
+            eq(3, page.receipts().getFirst().attempts());
+            eq(1L, client.group("g").frontiers().get(P0).next());
+        }
+    }
+
+    private static void waitingDoesNotBlockWindow() throws Exception {
+        var time = new Time();
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, 500, 500), time, Boundary.NONE);
+             var client = connect(server)) {
+            seed(client, 2, bytes("message"));
+            long epoch = client.join("g", "m", ORDERS).number();
+            var batch = client.pull(epoch, 2);
+            eq(List.of(0L, 1L), offsets(batch));
+            // Acknowledge offset 1 out of order before any lease expires, leaving offset 0 as the
+            // unfinished head that will be lost.
+            ack(client, epoch, batch.subList(1, 2));
+            eq(0L, client.group("g").frontiers().get(P0).next());
+            // Offset 0 is lost and starts a backoff anchored at its 1000ms lease deadline.
+            time.advance(1000);
+            eq(List.of(), client.pull(epoch, 8));
+            eq(1, client.group("g").frontiers().get(P0).retrying());
+            // The waiting head offset must not starve a fresh offset in the same window.
+            eq(2L, publish(client, "p", 2, bytes("fresh")).offset());
+            time.advance(299);
+            var fresh = client.pull(epoch, 8);
+            eq(List.of(2L), offsets(fresh));
+            eq(1, fresh.getFirst().lease().attempt());
+            ack(client, epoch, fresh);
+            time.advance(201);
+            var head = client.pull(epoch, 8);
+            eq(List.of(0L), offsets(head));
+            eq(2, head.getFirst().lease().attempt());
+            ack(client, epoch, head);
+            eq(List.of(), client.pull(epoch, 8));
+            eq(3L, client.group("g").frontiers().get(P0).next());
+            eq(0, client.group("g").frontiers().get(P0).retrying());
+        }
+    }
+
+    private static void backoffSurvivesReconnect() throws Exception {
+        var time = new Time();
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, 1000, 1000), time, Boundary.NONE);
+             var first = connect(server); var second = connect(server)) {
+            publish(first, "p", 0, bytes("survives"));
+            long epoch = first.join("g", "m", ORDERS).number();
+            first.pull(epoch, 1);
+            // Let the lease expire deterministically: pull at t+1100 sweeps it and anchors the
+            // 1000ms backoff at the t+1000 lease deadline, so it is due at t+2000.
+            time.advance(1000);
+            eq(List.of(), first.pull(epoch, 1));
+            eq(1, first.group("g").frontiers().get(P0).retrying());
+            // A same-member reconnect advances the epoch and replaces delivery state. It must
+            // neither reset the backoff to zero nor shorten the t+2000 deadline.
+            time.advance(100);
+            first.close();
+            var reconnect = second.join("g", "m", ORDERS);
+            check(reconnect.number() > epoch, "reconnect must advance the epoch");
+            eq(List.of(), second.pull(reconnect.number(), 1));
+            eq(1, second.group("g").frontiers().get(P0).retrying());
+            time.advance(899);
+            eq(List.of(), second.pull(reconnect.number(), 1));
+            time.advance(1);
+            var retry = second.pull(reconnect.number(), 1);
+            eq(2, retry.getFirst().lease().attempt());
+            eq(List.of(0L), offsets(retry));
+            ack(second, reconnect.number(), retry);
+        }
+    }
+
+    private static void backoffSurvivesMidLeaseDisconnect() throws Exception {
+        var time = new Time();
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, 1000, 1000), time, Boundary.NONE);
+             var first = connect(server); var second = connect(server)) {
+            publish(first, "p", 0, bytes("drop"));
+            long epoch = first.join("g", "m", ORDERS).number();
+            first.pull(epoch, 1);
+            // Sweep the expired lease at t+1000, anchoring a 1000ms backoff at the lease deadline
+            // so the offset is due at t+2000.
+            time.advance(1000);
+            eq(List.of(), first.pull(epoch, 1));
+            eq(1, first.group("g").frontiers().get(P0).retrying());
+            // Drop the connection: the persisted deadline must survive the reconnect and epoch
+            // change rather than restarting the wait or releasing the offset early.
+            first.close();
+            var reconnect = second.join("g", "m", ORDERS);
+            eq(List.of(), second.pull(reconnect.number(), 1));
+            eq(1, second.group("g").frontiers().get(P0).retrying());
+            time.advance(999);
+            eq(List.of(), second.pull(reconnect.number(), 1));
+            time.advance(1);
+            var retry = second.pull(reconnect.number(), 1);
+            eq(2, retry.getFirst().lease().attempt());
+            ack(second, reconnect.number(), retry);
+        }
+    }
+
+    private static void backoffSurvivesRestart() throws Exception {
+        var time = new Time();
+        try (var scratch = new Scratch()) {
+            var rooted = settings(scratch.root, 1000, 1000);
+            try (var server = TcpBroker.start(rooted, time, Boundary.NONE); var client = connect(server)) {
+                publish(client, "p", 0, bytes("restart"));
+                long epoch = client.join("g", "m", ORDERS).number();
+                client.pull(epoch, 1);
+                // Sweep the expired lease at t+1000; the backoff is anchored at the same instant,
+                // so the deadline is t+2000 and is persisted in the group snapshot.
+                time.advance(1000);
+                eq(List.of(), client.pull(epoch, 1));
+                eq(1, client.group("g").frontiers().get(P0).retrying());
+                time.advance(300);
+                client.close();
+            }
+            // Restart with 700ms of the original 1000ms backoff left: the deadline survives and
+            // is neither reset nor shortened.
+            try (var server = TcpBroker.start(rooted, time, Boundary.NONE); var client = connect(server)) {
+                long epoch = client.join("g", "m", ORDERS).number();
+                eq(List.of(), client.pull(epoch, 1));
+                eq(1, client.group("g").frontiers().get(P0).retrying());
+                time.advance(699);
+                eq(List.of(), client.pull(epoch, 1));
+                time.advance(1);
+                var retry = client.pull(epoch, 1);
+                eq(2, retry.getFirst().lease().attempt());
+                ack(client, epoch, retry);
+            }
+        }
+    }
+
+    private static void reservationNoBackoff() throws Exception {
+        var time = new Time();
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, 5000, 5000), time, Boundary.NONE);
+             var client = connect(server)) {
+            publish(client, "p", 0, bytes("reserve"));
+            long epoch = client.join("g", "m", ORDERS).number();
+            // Reserve without accepting: the attempt counter must stay at zero.
+            client.reserve(epoch, 1);
+            eq(0, client.group("g").frontiers().get(P0).retrying());
+            time.advance(1000);
+            // The expired reservation frees the slot with no backoff: the very next pull is
+            // immediately available at attempt 1.
+            var retry = client.pull(epoch, 1);
+            eq(1, retry.getFirst().lease().attempt());
+            ack(client, epoch, retry);
+            eq(0, client.group("g").frontiers().get(P0).retrying());
+        }
+    }
+
+    private static void terminalAfterBackoff() throws Exception {
+        var time = new Time();
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root, 100, 100, 2), time, Boundary.NONE);
+             var client = connect(server)) {
+            publish(client, "p", 0, bytes("terminal"));
+            long epoch = client.join("g", "m", ORDERS).number();
+            client.pull(epoch, 1);
+            time.advance(1000);
+            eq(List.of(), client.pull(epoch, 1));
+            time.advance(100);
+            var second = client.pull(epoch, 1);
+            eq(2, second.getFirst().lease().attempt());
+            // The second attempt reaches the maximum. Expiry is terminal immediately — no extra
+            // waiting state — and the dead letter is written once.
+            time.advance(1000);
+            eq(List.of(), client.pull(epoch, 1));
+            var page = client.deadLetters("g", 0, 4);
+            eq(1, page.receipts().size());
+            eq(2, page.receipts().getFirst().attempts());
+            eq(1L, client.group("g").frontiers().get(P0).next());
+            eq(0, client.group("g").frontiers().get(P0).retrying());
+        }
+    }
+
     private static void retry() throws Exception {
         var time = new Time();
         try (var tmp = new Scratch();
@@ -379,6 +597,93 @@ public final class BrokerTest {
                 eq(1L, client.group("g").epoch());
                 eq(Map.of(), client.group("g").assignments());
                 eq(2L, client.join("g", "m", ORDERS).number());
+            }
+        }
+    }
+
+    private static void legacyGroupSnapshot() throws Exception {
+        var time = new Time();
+        try (var tmp = new Scratch()) {
+            var config = settings(tmp.root);
+            try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+                publish(client, "p", 0, bytes("legacy"));
+                long epoch = client.join("g", "m", ORDERS).number();
+                ack(client, epoch, client.pull(epoch, 1));
+            }
+            // The broker wrote a v2 snapshot. Rewrite it as the v1 layout by dropping the
+            // per-partition retry-deadline count for the single subscribed partition.
+            java.nio.file.Path path = tmp.root.resolve("groups/g.group");
+            byte[] snapshot = java.nio.file.Files.readAllBytes(path);
+            try (var in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(snapshot))) {
+                int magic = in.readInt();
+                int version = in.readInt();
+                eq(0x544D4750, magic);
+                eq(2, version);
+                int bodyLength = in.readInt();
+                byte[] body = in.readNBytes(bodyLength);
+                eq(bodyLength, body.length);
+                // A single partition ends with i32 retry-deadline count 0.
+                byte[] legacyBody = java.util.Arrays.copyOf(body, body.length - 4);
+                var rewritten = tidemq.Binary.encode(bytesOut -> {
+                    bytesOut.writeInt(magic);
+                    bytesOut.writeInt(1);
+                    tidemq.Binary.writeBytes(bytesOut, legacyBody);
+                    bytesOut.writeInt(tidemq.segment.Disk.checksum(legacyBody));
+                });
+                java.nio.file.Files.write(path, rewritten);
+            }
+            // Reopening must accept the v1 snapshot and preserve the frontier.
+            try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+                eq(1L, client.group("g").frontiers().get(P0).next());
+                eq(0, client.group("g").frontiers().get(P0).retrying());
+                long epoch = client.join("g", "m", ORDERS).number();
+                eq(List.of(), client.pull(epoch, 8));
+            }
+        }
+    }
+
+    private static void retryBackoffConfig() throws Exception {
+        try (var tmp = new Scratch()) {
+            java.nio.file.Path properties = tmp.root.resolve("broker.properties");
+            java.nio.file.Files.writeString(properties, """
+                    listen.host=127.0.0.1
+                    listen.port=0
+                    data.directory=%s
+                    topics=orders:1
+                    delivery.retry.backoff.ms=100
+                    delivery.retry.backoff.max.ms=1000
+                    """.formatted(tmp.root.resolve("data")));
+            var settings = Settings.load(properties);
+            eq(100L, settings.retryDelay(1));
+            eq(200L, settings.retryDelay(2));
+            eq(400L, settings.retryDelay(3));
+            eq(800L, settings.retryDelay(4));
+            eq(1000L, settings.retryDelay(5));
+            eq(1000L, settings.retryDelay(1000));
+            eq(0L, settings.retryDelay(0));
+            java.nio.file.Files.writeString(properties, """
+                    listen.host=127.0.0.1
+                    listen.port=0
+                    data.directory=%s
+                    topics=orders:1
+                    delivery.retry.backoff.ms=0
+                    """.formatted(tmp.root.resolve("disabled")));
+            var disabled = Settings.load(properties);
+            eq(0L, disabled.retryDelay(1));
+            eq(0L, disabled.retryDelay(4));
+            java.nio.file.Files.writeString(properties, """
+                    listen.host=127.0.0.1
+                    listen.port=0
+                    data.directory=%s
+                    topics=orders:1
+                    delivery.retry.backoff.ms=500
+                    delivery.retry.backoff.max.ms=100
+                    """.formatted(tmp.root.resolve("invalid")));
+            try {
+                Settings.load(properties);
+                throw new AssertionError("inverted backoff bounds must be rejected");
+            } catch (IllegalArgumentException expected) {
+                // The cap cannot be smaller than the base.
             }
         }
     }

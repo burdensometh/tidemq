@@ -18,7 +18,8 @@ import java.util.TreeSet;
 
 final class GroupStore {
     private static final int MAGIC = 0x544D4750; // TMGP
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
+    private static final int LEGACY_VERSION = 1;
     private static final int MAX_SNAPSHOT_BYTES = 10 * 1024 * 1024;
     private static final int MAX_AHEAD = 8192;
     private static final String SUFFIX = ".group";
@@ -54,14 +55,18 @@ final class GroupStore {
         }
         try {
             return Binary.decode(Files.readAllBytes(path), in -> {
-                if (in.readInt() != MAGIC || in.readInt() != VERSION) {
+                if (in.readInt() != MAGIC) {
                     throw new IOException("invalid v1 group header");
+                }
+                int version = in.readInt();
+                if (version != VERSION && version != LEGACY_VERSION) {
+                    throw new IOException("unsupported group snapshot version " + version);
                 }
                 byte[] body = Binary.readBytes(in, MAX_SNAPSHOT_BYTES);
                 if (in.readInt() != Disk.checksum(body)) {
                     throw new IOException("group snapshot checksum mismatch");
                 }
-                GroupState group = decode(body);
+                GroupState group = decode(body, version);
                 if (!path.equals(pathFor(group.name()))) {
                     throw new IOException("group name disagrees with filename");
                 }
@@ -116,11 +121,16 @@ final class GroupStore {
                     out.writeLong(attempt.getKey());
                     out.writeInt(attempt.getValue());
                 }
+                out.writeInt(frontier.retryDeadlines().size());
+                for (var deadline : frontier.retryDeadlines().entrySet()) {
+                    out.writeLong(deadline.getKey());
+                    out.writeLong(deadline.getValue());
+                }
             }
         });
     }
 
-    private GroupState decode(byte[] body) throws IOException {
+    private GroupState decode(byte[] body, int version) throws IOException {
         return Binary.decode(body, in -> {
             String name = Settings.requireIdentifier(Binary.readText(in, Settings.MAX_IDENTIFIER), "group");
             long epoch = in.readLong();
@@ -143,7 +153,7 @@ final class GroupStore {
             int partitions = Binary.readCount(in, 64);
             for (int i = 0; i < partitions; i++) {
                 TopicPartition partition = MessageV1.readPartition(in);
-                AckFrontier frontier = readFrontier(in, segments.range(partition));
+                AckFrontier frontier = readFrontier(in, segments.range(partition), version >= VERSION);
                 if (!topics.contains(partition.topic()) || frontiers.putIfAbsent(partition, frontier) != null) {
                     throw new IOException("invalid persisted partition in group");
                 }
@@ -159,7 +169,8 @@ final class GroupStore {
         });
     }
 
-    private static AckFrontier readFrontier(java.io.DataInputStream in, SegmentStore.Range range) throws IOException {
+    private static AckFrontier readFrontier(java.io.DataInputStream in, SegmentStore.Range range, boolean withDeadlines)
+            throws IOException {
         long next = in.readLong();
         if (next < range.retainedFrom() || next > range.nextOffset()) {
             throw new IOException("group frontier outside retained partition bounds");
@@ -182,7 +193,19 @@ final class GroupStore {
                 throw new IOException("invalid retry counter");
             }
         }
-        return new AckFrontier(next, completed, attempts);
+        var deadlines = new TreeMap<Long, Long>();
+        if (withDeadlines) {
+            int deadlineCount = Binary.readCount(in, MAX_AHEAD);
+            for (int j = 0; j < deadlineCount; j++) {
+                long offset = in.readLong();
+                long deadline = in.readLong();
+                if (!inWindow(offset, next, range) || deadline < 0 || completed.contains(offset)
+                        || attempts.get(offset) == null || deadlines.putIfAbsent(offset, deadline) != null) {
+                    throw new IOException("invalid retry deadline");
+                }
+            }
+        }
+        return new AckFrontier(next, completed, attempts, deadlines);
     }
 
     private static boolean inWindow(long offset, long next, SegmentStore.Range range) {

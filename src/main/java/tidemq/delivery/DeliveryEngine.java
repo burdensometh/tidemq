@@ -57,11 +57,31 @@ public final class DeliveryEngine {
                     terminal(group, partition, offset, now);
                     changed.add(group);
                 }
+                for (long offset : waitingWithoutDeadline(frontier)) {
+                    if (scheduleRetry(frontier, offset, now)) {
+                        changed.add(group);
+                    }
+                }
             }
         }
         for (GroupState group : changed) {
             groups.saveProgress(group);
         }
+    }
+
+    /**
+     * Offsets that consumed an accepted attempt but left no durable retry deadline — a crash
+     * between acceptance and loss, or a snapshot written before deadlines existed. Their backoff
+     * restarts at recovery time so a restart never makes them available sooner than configured.
+     */
+    private static List<Long> waitingWithoutDeadline(AckFrontier frontier) {
+        var result = new ArrayList<Long>();
+        for (long offset : frontier.unconsumedAttempted()) {
+            if (frontier.retryDeadline(offset) < 0) {
+                result.add(offset);
+            }
+        }
+        return result;
     }
 
     public void invalidate(String group, long now) throws IOException {
@@ -127,18 +147,37 @@ public final class DeliveryEngine {
     }
 
     private void dispose(GroupState group, LeaseBook book, List<LeaseBook.Entry> expired, long now) throws IOException {
-        boolean advanced = false;
+        boolean changed = false;
         for (LeaseBook.Entry entry : expired) {
             var ref = entry.ref();
-            if (entry.accepted() && group.frontier(ref.partition()).attempts(ref.offset()) >= settings.maxAttempts()) {
-                terminal(group, ref.partition(), ref.offset(), now);
-                advanced = true;
+            AckFrontier frontier = group.frontier(ref.partition());
+            if (entry.accepted()) {
+                if (frontier.attempts(ref.offset()) >= settings.maxAttempts()) {
+                    terminal(group, ref.partition(), ref.offset(), now);
+                    changed = true;
+                } else {
+                    // A consumed accepted attempt earns a backoff. The backoff starts when the
+                    // delivery is actually lost: the lease deadline if it already passed, or the
+                    // disconnect instant if the session vanished mid-lease. A plain reservation
+                    // never increments attempts, so its expiry only releases the slot.
+                    long lostAt = Math.min(entry.activeUntil(), now);
+                    changed |= scheduleRetry(frontier, ref.offset(), lostAt);
+                }
             }
             book.remove(entry);
         }
-        if (advanced) {
+        if (changed) {
             groups.saveProgress(group);
         }
+    }
+
+    private boolean scheduleRetry(AckFrontier frontier, long offset, long lostAt) throws IOException {
+        long delay = settings.retryDelay(frontier.attempts(offset));
+        if (delay <= 0) {
+            return false;
+        }
+        frontier.scheduleRetry(offset, deadline(lostAt, delay));
+        return true;
     }
 
     private void terminal(GroupState group, TopicPartition partition, long offset, long now) throws IOException {
@@ -166,7 +205,7 @@ public final class DeliveryEngine {
             AckFrontier frontier = group.frontier(partition);
             long first = frontier.next();
             long last = Math.min(segments.range(partition).nextOffset(), deadline(first, settings.deliveryWindow()));
-            cursors.add(new Cursor(partition, frontier, first, last));
+            cursors.add(new Cursor(partition, frontier, first, last, now));
         }
         return select(epoch, session, capacity, byteBudget, now, book, cursors);
     }
@@ -297,20 +336,31 @@ public final class DeliveryEngine {
         final AckFrontier frontier;
         long offset;
         final long end;
+        final long now;
 
-        Cursor(TopicPartition partition, AckFrontier frontier, long offset, long end) {
+        Cursor(TopicPartition partition, AckFrontier frontier, long offset, long end, long now) {
             this.partition = partition;
             this.frontier = frontier;
             this.offset = offset;
             this.end = end;
+            this.now = now;
         }
 
         Message next(LeaseBook book) throws IOException {
             while (offset < end) {
                 long current = offset++;
-                if (!frontier.isComplete(current) && !book.has(partition, current)) {
-                    return segments.read(partition, current);
+                if (frontier.isComplete(current)) {
+                    continue;
                 }
+                if (book.has(partition, current)) {
+                    continue;
+                }
+                // A waiting offset is passed over, not treated as a barrier: other compliant
+                // offsets in the same partition window remain eligible during its backoff.
+                if (frontier.isWaiting(current, now)) {
+                    continue;
+                }
+                return segments.read(partition, current);
             }
             return null;
         }
