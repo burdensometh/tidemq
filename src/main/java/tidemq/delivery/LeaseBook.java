@@ -14,6 +14,13 @@ import java.util.Map;
 final class LeaseBook {
     private record Slot(TopicPartition partition, long offset) {}
 
+    /**
+     * A partition whose ownership moved while the prior owner's session is still
+     * alive. The destination must not pull it until the source session ends or
+     * hands the partition back.
+     */
+    record Handoff(TopicPartition partition, String member, long session) {}
+
     static final class Entry {
         private final DeliveryLease.Ref ref;
         private final long epoch;
@@ -40,6 +47,14 @@ final class LeaseBook {
             return activeUntil;
         }
 
+        long session() {
+            return session;
+        }
+
+        long epoch() {
+            return epoch;
+        }
+
         boolean accepted() {
             return accepted;
         }
@@ -58,9 +73,54 @@ final class LeaseBook {
     private final Map<Slot, Entry> bySlot = new HashMap<>();
     private final Map<String, Integer> byMember = new HashMap<>();
     private final Map<String, Integer> rotation = new HashMap<>();
+    private final Map<TopicPartition, Handoff> handoffs = new HashMap<>();
 
     boolean has(TopicPartition partition, long offset) {
         return bySlot.containsKey(new Slot(partition, offset));
+    }
+
+    Handoff handoff(TopicPartition partition) {
+        return handoffs.get(partition);
+    }
+
+    java.util.Collection<Handoff> handoffs() {
+        return handoffs.values();
+    }
+
+    void blockHandoff(TopicPartition partition, String member, long session) {
+        handoffs.put(partition, new Handoff(partition, member, session));
+    }
+
+    void unblockHandoff(TopicPartition partition) {
+        handoffs.remove(partition);
+    }
+
+    /** Drops every handoff sourced by the ended session; returns the removed blocks. */
+    List<Handoff> unblockSession(long session) {
+        var removed = new ArrayList<Handoff>();
+        var iterator = handoffs.values().iterator();
+        while (iterator.hasNext()) {
+            Handoff handoff = iterator.next();
+            if (handoff.session() == session) {
+                removed.add(handoff);
+                iterator.remove();
+            }
+        }
+        return removed;
+    }
+
+    Entry token(long id) {
+        return byToken.get(id);
+    }
+
+    List<Entry> entriesForSession(long session) {
+        var result = new ArrayList<Entry>();
+        for (Entry entry : byToken.values()) {
+            if (entry.session == session) {
+                result.add(entry);
+            }
+        }
+        return result;
     }
 
     int count(String member) {

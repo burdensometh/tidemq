@@ -71,6 +71,85 @@ public final class DeliveryEngine {
         }
     }
 
+    /**
+     * Applies a membership transition without discarding deliveries that are still
+     * owned by a live session. Partitions that moved to another owner enter a
+     * cooperative handoff: the source session keeps its leases and only it may
+     * settle them, while the destination skips the partition. Sessions that ended
+     * lose their leases immediately so receivers can continue unfinished offsets.
+     */
+    public void reconcile(String groupName, GroupState.Ownership before, long now) throws IOException {
+        GroupState group = groups.require(groupName);
+        LeaseBook book = books.computeIfAbsent(groupName, name -> new LeaseBook());
+        var releasedByEndedSession = new HashSet<TopicPartition>();
+        for (var prior : before.sessions().entrySet()) {
+            String member = prior.getKey();
+            long session = prior.getValue();
+            if (group.sessionOf(member) == session) {
+                continue;
+            }
+            for (LeaseBook.Handoff handoff : book.unblockSession(session)) {
+                releasedByEndedSession.add(handoff.partition());
+            }
+            dispose(group, book, book.entriesForSession(session), now);
+        }
+        GroupState.Ownership after = group.ownership();
+        for (TopicPartition partition : group.partitions()) {
+            GroupState.Owner oldOwner = before.partitions().get(partition);
+            GroupState.Owner currentOwner = after.partitions().get(partition);
+            LeaseBook.Handoff handoff = book.handoff(partition);
+            if (handoff != null) {
+                if (currentOwner != null && handoff.session() == currentOwner.session()
+                        && handoff.member().equals(currentOwner.member())) {
+                    book.unblockHandoff(partition);
+                }
+                continue;
+            }
+            if (oldOwner == null) {
+                continue;
+            }
+            // The nominal owner may shuffle between survivors in the same rebalance that
+            // ended a handoff source. That shuffle completes the handoff rather than
+            // opening a new one, otherwise survivors could block each other in a cycle.
+            if (releasedByEndedSession.contains(partition)) {
+                continue;
+            }
+            if (group.sessionOf(oldOwner.member()) != oldOwner.session()) {
+                continue;
+            }
+            boolean moved = currentOwner == null
+                    || !oldOwner.member().equals(currentOwner.member())
+                    || oldOwner.session() != currentOwner.session();
+            if (moved) {
+                book.blockHandoff(partition, oldOwner.member(), oldOwner.session());
+            }
+        }
+    }
+
+    /**
+     * Safety net for any session disappearance not observed through
+     * {@link #reconcile}: drop blocks and leases whose member session is gone.
+     */
+    private void releaseDeparted(GroupState group, LeaseBook book, long now) throws IOException {
+        List<LeaseBook.Entry> departed = null;
+        for (LeaseBook.Entry entry : book.entries()) {
+            if (group.sessionOf(entry.member()) != entry.session()) {
+                if (departed == null) {
+                    departed = new ArrayList<>();
+                }
+                departed.add(entry);
+            }
+        }
+        if (departed != null) {
+            dispose(group, book, departed, now);
+        }
+        for (LeaseBook.Handoff handoff : List.copyOf(book.handoffs())) {
+            if (group.sessionOf(handoff.member()) != handoff.session()) {
+                book.unblockHandoff(handoff.partition());
+            }
+        }
+    }
+
     public void sweep(long now) throws IOException {
         for (var entry : books.entrySet()) {
             expire(groups.require(entry.getKey()), entry.getValue(), now);
@@ -155,6 +234,7 @@ public final class DeliveryEngine {
         }
         GroupState group = groups.require(epoch.group());
         LeaseBook book = books.computeIfAbsent(group.name(), name -> new LeaseBook());
+        releaseDeparted(group, book, now);
         expire(group, book, now);
         int capacity = Math.min(limit, settings.maxInflight() - book.count(epoch.member()));
         List<TopicPartition> assigned = epoch.assignment();
@@ -163,12 +243,34 @@ public final class DeliveryEngine {
         }
         var cursors = new ArrayList<Cursor>(assigned.size());
         for (TopicPartition partition : assigned) {
+            if (isBlocked(group, book, partition)) {
+                continue;
+            }
             AckFrontier frontier = group.frontier(partition);
             long first = frontier.next();
             long last = Math.min(segments.range(partition).nextOffset(), deadline(first, settings.deliveryWindow()));
             cursors.add(new Cursor(partition, frontier, first, last));
         }
+        if (cursors.isEmpty()) {
+            return List.of();
+        }
         return select(epoch, session, capacity, byteBudget, now, book, cursors);
+    }
+
+    /**
+     * A transferred partition is invisible to every pull while its source session
+     * remains alive. Blocks whose source vanished are cleared defensively.
+     */
+    private boolean isBlocked(GroupState group, LeaseBook book, TopicPartition partition) {
+        LeaseBook.Handoff handoff = book.handoff(partition);
+        if (handoff == null) {
+            return false;
+        }
+        if (group.sessionOf(handoff.member()) == handoff.session()) {
+            return true;
+        }
+        book.unblockHandoff(partition);
+        return false;
     }
 
     private List<DeliveryLease> select(GroupEpoch epoch, long session, int limit, int byteBudget, long now,
@@ -209,12 +311,21 @@ public final class DeliveryEngine {
         return List.copyOf(leases);
     }
 
-    public List<DeliveryLease.Acceptance> accept(GroupEpoch epoch, long session, List<DeliveryLease.Ref> refs, long now)
+    /** Compatibility entry point for callers that already resolved the current epoch. */
+    public List<DeliveryLease.Acceptance> accept(GroupEpoch epoch, long session,
+                                                 List<DeliveryLease.Ref> refs, long now) throws IOException {
+        return accept(epoch.group(), epoch.member(), session, epoch.number(), refs, now);
+    }
+
+    public List<DeliveryLease.Acceptance> accept(String groupName, String memberName, long session,
+                                                 long requestedEpoch, List<DeliveryLease.Ref> refs, long now)
             throws IOException {
-        GroupState group = groups.require(epoch.group());
-        LeaseBook book = requireBook(epoch);
+        Settlement settlement = settleGroup(groupName, memberName, session, requestedEpoch);
+        GroupState group = settlement.group();
+        LeaseBook book = settlement.book();
+        releaseDeparted(group, book, now);
         expire(group, book, now);
-        List<LeaseBook.Entry> entries = resolve(book, epoch, session, refs);
+        List<LeaseBook.Entry> entries = resolveSettlement(settlement, refs);
         boolean changed = false;
         var result = new ArrayList<DeliveryLease.Acceptance>(entries.size());
         for (LeaseBook.Entry entry : entries) {
@@ -233,12 +344,21 @@ public final class DeliveryEngine {
         return List.copyOf(result);
     }
 
-    public Map<TopicPartition, Long> ack(GroupEpoch epoch, long session, List<DeliveryLease.Ref> refs, long now)
+    /** Compatibility entry point for callers that already resolved the current epoch. */
+    public Map<TopicPartition, Long> ack(GroupEpoch epoch, long session,
+                                         List<DeliveryLease.Ref> refs, long now) throws IOException {
+        return ack(epoch.group(), epoch.member(), session, epoch.number(), refs, now);
+    }
+
+    public Map<TopicPartition, Long> ack(String groupName, String memberName, long session,
+                                         long requestedEpoch, List<DeliveryLease.Ref> refs, long now)
             throws IOException {
-        GroupState group = groups.require(epoch.group());
-        LeaseBook book = requireBook(epoch);
+        Settlement settlement = settleGroup(groupName, memberName, session, requestedEpoch);
+        GroupState group = settlement.group();
+        LeaseBook book = settlement.book();
+        releaseDeparted(group, book, now);
         expire(group, book, now);
-        List<LeaseBook.Entry> entries = resolve(book, epoch, session, refs);
+        List<LeaseBook.Entry> entries = resolveSettlement(settlement, refs);
         for (LeaseBook.Entry entry : entries) {
             if (!entry.accepted()) {
                 throw new BrokerException(BrokerException.Code.UNKNOWN_LEASE, "accept delivery before acknowledging it");
@@ -257,28 +377,76 @@ public final class DeliveryEngine {
         return result;
     }
 
-    private LeaseBook requireBook(GroupEpoch epoch) throws BrokerException {
-        LeaseBook book = books.get(epoch.group());
-        if (book == null) {
-            throw new BrokerException(BrokerException.Code.UNKNOWN_LEASE, "group has no active delivery");
-        }
-        return book;
+    private Settlement settleGroup(String groupName, String memberName, long session,
+                                   long requestedEpoch) throws BrokerException {
+        GroupState group = groups.require(groupName);
+        GroupEpoch current = groups.current(groupName, memberName, session);
+        LeaseBook book = books.computeIfAbsent(groupName, name -> new LeaseBook());
+        boolean currentGeneration = requestedEpoch == current.number();
+        return new Settlement(group, book, current, session, requestedEpoch, currentGeneration);
     }
 
-    private List<LeaseBook.Entry> resolve(LeaseBook book, GroupEpoch epoch, long session, List<DeliveryLease.Ref> refs)
+    private record Settlement(GroupState group, LeaseBook book, GroupEpoch current, long session,
+                              long requestedEpoch, boolean currentGeneration) {}
+
+    private List<LeaseBook.Entry> resolveSettlement(Settlement settlement, List<DeliveryLease.Ref> refs)
             throws BrokerException {
+        LeaseBook book = settlement.book();
+        GroupState group = settlement.group();
         if (refs.isEmpty() || refs.size() > settings.maxBatch()) {
             throw new BrokerException(BrokerException.Code.BAD_REQUEST, "invalid number of lease references");
         }
         var seen = new HashSet<Long>();
         var entries = new ArrayList<LeaseBook.Entry>(refs.size());
+        GroupEpoch current = settlement.current();
         for (DeliveryLease.Ref ref : refs) {
             if (!seen.add(ref.id())) {
                 throw new BrokerException(BrokerException.Code.BAD_REQUEST, "duplicate lease reference");
             }
-            entries.add(book.require(ref, epoch, session));
+            LeaseBook.Entry entry = book.token(ref.id());
+            if (entry == null || entry.session() != settlement.session()
+                    || !entry.member().equals(current.member()) || !entry.ref().equals(ref)) {
+                throw new BrokerException(BrokerException.Code.UNKNOWN_LEASE,
+                        "no active delivery for lease " + ref.id());
+            }
+            entries.add(entry);
+        }
+        if (!settlement.currentGeneration()) {
+            // A prior generation may settle the session's own batch when it participates
+            // in a cooperative handoff. A stale batch touching only partitions the
+            // session still owns stays epoch fenced.
+            long requested = settlement.requestedEpoch();
+            boolean priorGeneration = requested > 0 && requested < current.number();
+            boolean handoffBatch = false;
+            if (priorGeneration) {
+                for (DeliveryLease.Ref ref : refs) {
+                    if (transferredAway(group, book, ref.partition(), current.member(), settlement.session())) {
+                        handoffBatch = true;
+                        break;
+                    }
+                }
+            }
+            if (!handoffBatch) {
+                throw new BrokerException(BrokerException.Code.STALE_EPOCH,
+                        "membership epoch changed to " + current.number());
+            }
         }
         return entries;
+    }
+
+    /**
+     * True when the partition is under cooperative handoff sourced by this session,
+     * or its current assignment belongs to another session. Partitions the same
+     * session still owns keep strict epoch fencing for stale requests.
+     */
+    private boolean transferredAway(GroupState group, LeaseBook book, TopicPartition partition,
+                                    String member, long session) {
+        LeaseBook.Handoff handoff = book.handoff(partition);
+        if (handoff != null && handoff.member().equals(member) && handoff.session() == session) {
+            return true;
+        }
+        GroupState.Owner owner = group.ownership().partitions().get(partition);
+        return owner != null && (!owner.member().equals(member) || owner.session() != session);
     }
 
     private long issueLease() throws IOException {

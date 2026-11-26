@@ -80,24 +80,18 @@ public final class Broker implements AutoCloseable {
 
     public GroupEpoch join(Member member, Set<String> topics) throws IOException {
         return run(() -> {
-            long before;
-            try {
-                before = groups.require(member.group()).epoch();
-            } catch (BrokerException unknown) {
-                before = 0;
-            }
+            var before = groups.ownership(member.group());
             GroupEpoch epoch = groups.join(member.group(), member.name(), member.session(), topics);
-            if (before != epoch.number()) {
-                delivery.invalidate(member.group(), now());
-            }
+            delivery.reconcile(member.group(), before, now());
             return epoch;
         });
     }
 
     public void leave(Member member) throws IOException {
         run(() -> {
+            var before = groups.ownership(member.group());
             if (groups.disconnect(member.group(), member.name(), member.session())) {
-                delivery.invalidate(member.group(), now());
+                delivery.reconcile(member.group(), before, now());
             }
             return null;
         });
@@ -114,12 +108,12 @@ public final class Broker implements AutoCloseable {
 
     public List<DeliveryLease.Acceptance> accept(Member member, long epoch, List<DeliveryLease.Ref> refs)
             throws IOException {
-        return run(() -> delivery.accept(checkEpoch(member, epoch), member.session(), refs, now()));
+        return run(() -> delivery.accept(member.group(), member.name(), member.session(), epoch, refs, now()));
     }
 
     public Map<TopicPartition, Long> ack(Member member, long epoch, List<DeliveryLease.Ref> refs)
             throws IOException {
-        return run(() -> delivery.ack(checkEpoch(member, epoch), member.session(), refs, now()));
+        return run(() -> delivery.ack(member.group(), member.name(), member.session(), epoch, refs, now()));
     }
 
     private GroupEpoch checkEpoch(Member member, long epoch) throws BrokerException {

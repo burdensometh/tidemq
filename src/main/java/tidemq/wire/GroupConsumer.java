@@ -126,7 +126,7 @@ public final class GroupConsumer implements AutoCloseable {
         }
         operation.lock();
         try {
-            if (closed || client == null || batch.incarnation != incarnation || batch.epoch() != assignment.number()) {
+            if (closed || client == null || batch.incarnation != incarnation) {
                 throw new BrokerException(BrokerException.Code.STALE_EPOCH,
                         "batch belongs to an earlier connection or epoch");
             }
@@ -135,7 +135,18 @@ public final class GroupConsumer implements AutoCloseable {
             }
             List<DeliveryLease.Ref> refs = processed.stream().map(TideClient.Received::lease)
                     .map(DeliveryLease::ref).toList();
-            return client.ack(batch.epoch(), refs);
+            try {
+                return client.ack(assignment.number(), refs);
+            } catch (BrokerException changed) {
+                if (changed.code() != BrokerException.Code.STALE_EPOCH
+                        || batch.incarnation != incarnation) {
+                    throw changed;
+                }
+                // Cooperative rebalance advanced the group generation on this same
+                // connection: refresh once and settle against the current epoch.
+                assignment = client.assignment();
+                return client.ack(assignment.number(), refs);
+            }
         } catch (BrokerException rejected) {
             throw rejected;
         } catch (IOException transport) {

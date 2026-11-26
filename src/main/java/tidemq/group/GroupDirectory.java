@@ -92,6 +92,12 @@ public final class GroupDirectory {
         return state;
     }
 
+    /** Assignment/session snapshot before a transition; empty when the group does not exist yet. */
+    public GroupState.Ownership ownership(String group) {
+        GroupState state = groups.get(group);
+        return state == null ? GroupState.Ownership.EMPTY : state.ownership();
+    }
+
     public GroupEpoch current(String group, String member, long session) throws BrokerException {
         return require(group).current(member, session);
     }

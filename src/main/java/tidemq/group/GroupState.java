@@ -15,6 +15,15 @@ import java.util.TreeSet;
 public final class GroupState {
     record Member(String name, long session) {}
 
+    /** One membership incarnation that owns partitions. Session ids are per TCP connection. */
+    public record Owner(String member, long session) {}
+
+    /** Immutable assignment/session snapshot used to derive cooperative handoffs. */
+    public record Ownership(long epoch, Map<TopicPartition, Owner> partitions,
+                            Map<String, Long> sessions) {
+        static final Ownership EMPTY = new Ownership(0L, Map.of(), Map.of());
+    }
+
     private final String name;
     private final Set<String> subscriptions;
     private final NavigableMap<TopicPartition, AckFrontier> frontiers;
@@ -59,6 +68,28 @@ public final class GroupState {
 
     Member member(String name) {
         return members.get(name);
+    }
+
+    /** Current session of a member name, or {@code -1} when the member is absent. */
+    public long sessionOf(String name) {
+        Member member = members.get(name);
+        return member == null ? -1L : member.session();
+    }
+
+    /** Reverse assignment map plus live sessions, captured under the broker transition lock. */
+    public Ownership ownership() {
+        var owners = new TreeMap<TopicPartition, Owner>();
+        assignments.forEach((member, assigned) -> {
+            long session = members.get(member).session();
+            var owner = new Owner(member, session);
+            for (TopicPartition partition : assigned) {
+                owners.put(partition, owner);
+            }
+        });
+        var sessions = new TreeMap<String, Long>();
+        members.forEach((member, value) -> sessions.put(member, value.session()));
+        return new Ownership(epoch, Collections.unmodifiableMap(owners),
+                Collections.unmodifiableMap(sessions));
     }
 
     void join(String name, long session) throws BrokerException {
