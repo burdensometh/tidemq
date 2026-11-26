@@ -54,7 +54,7 @@ public final class DeliveryEngine {
             for (TopicPartition partition : group.partitions()) {
                 AckFrontier frontier = group.frontier(partition);
                 for (long offset : frontier.exhausted(settings.maxAttempts())) {
-                    terminal(group, partition, offset, now);
+                    terminal(group, partition, offset, frontier.attempts(offset), now);
                     changed.add(group);
                 }
             }
@@ -129,9 +129,18 @@ public final class DeliveryEngine {
     private void dispose(GroupState group, LeaseBook book, List<LeaseBook.Entry> expired, long now) throws IOException {
         boolean advanced = false;
         for (LeaseBook.Entry entry : expired) {
+            // Fence ACKed entries and stale expiry records left over from a replaced generation:
+            // they are no longer this book's live entry and must not evict a newer lease occupying
+            // the same slot or terminalize/delete-letter an already settled message twice.
+            if (!book.isLive(entry)) {
+                continue;
+            }
             var ref = entry.ref();
-            if (entry.accepted() && group.frontier(ref.partition()).attempts(ref.offset()) >= settings.maxAttempts()) {
-                terminal(group, ref.partition(), ref.offset(), now);
+            // Reserved leases never consumed an attempt: expiring one only frees its slot so the
+            // message can be reserved again. Accepted leases carry their original persisted count;
+            // that count (not a re-read mutable by a later generation) decides retry vs terminal.
+            if (entry.accepted() && entry.attempts() >= settings.maxAttempts()) {
+                terminal(group, ref.partition(), ref.offset(), entry.attempts(), now);
                 advanced = true;
             }
             book.remove(entry);
@@ -141,10 +150,11 @@ public final class DeliveryEngine {
         }
     }
 
-    private void terminal(GroupState group, TopicPartition partition, long offset, long now) throws IOException {
+    private void terminal(GroupState group, TopicPartition partition, long offset, int attempts, long now)
+            throws IOException {
         AckFrontier frontier = group.frontier(partition);
         Message message = segments.read(partition, offset);
-        deadLetters.archive(group.name(), message, frontier.attempts(offset), now);
+        deadLetters.archive(group.name(), message, attempts, now);
         frontier.complete(offset);
     }
 
@@ -221,8 +231,8 @@ public final class DeliveryEngine {
             var ref = entry.ref();
             if (!entry.accepted()) {
                 AckFrontier frontier = group.frontier(ref.partition());
-                frontier.beginAttempt(ref.offset());
-                entry.accept(deadline(now, settings.leaseMs()));
+                int attempts = frontier.beginAttempt(ref.offset());
+                book.accept(entry, deadline(now, settings.leaseMs()), attempts);
                 changed = true;
             }
             result.add(new DeliveryLease.Acceptance(ref, entry.activeUntil()));
