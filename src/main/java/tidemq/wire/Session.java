@@ -106,6 +106,7 @@ final class Session {
             case PULL -> pull(body);
             case ACCEPT -> accept(body);
             case ACK -> acknowledge(body);
+            case TERMINATE -> terminate(body);
             case LEAVE -> {
                 expectEmpty(body);
                 broker.leave(requireMember());
@@ -213,6 +214,12 @@ final class Session {
     private byte[] acknowledge(byte[] body) throws IOException {
         var settlement = read(body, WireValues::readSettlement);
         var result = broker.ack(requireMember(), settlement.epoch(), settlement.refs());
+        return Binary.encode(out -> WireValues.writeFrontiers(out, result));
+    }
+
+    private byte[] terminate(byte[] body) throws IOException {
+        var settlement = read(body, WireValues::readSettlement);
+        var result = broker.terminate(requireMember(), settlement.epoch(), settlement.refs());
         return Binary.encode(out -> WireValues.writeFrontiers(out, result));
     }
 

@@ -54,6 +54,7 @@ public final class ClientMain {
                       produce-file PRODUCER SEQUENCE TOPIC PARTITION|- KEY PATH
                       produce-lines PRODUCER FIRST_SEQUENCE TOPIC PARTITION|- KEY
                       consume GROUP MEMBER TOPIC[,TOPIC...] COUNT [IDLE_POLLS]
+                      terminate GROUP MEMBER TOPIC PARTITION OFFSET[,...]
                       group GROUP
                       flow GROUP
                       partition TOPIC PARTITION [SEGMENTS]
@@ -63,6 +64,7 @@ public final class ClientMain {
 
                     PARTITION '-' routes by UTF-8 key. produce-lines reads one UTF-8 message per stdin line.
                     consume writes base64 records to stdout and acknowledges after flushing them.
+                    terminate archives the accepted deliveries at the given partition offsets as dead letters.
                     """);
             return;
         }
@@ -84,6 +86,11 @@ public final class ClientMain {
                     () -> TideClient.connect(args[0], port))) {
                 consume(consumer, commandArgs[0], commandArgs[1], count, idle, output);
             }
+            return;
+        }
+        if (args[2].equals("terminate")) {
+            arity(args[2], commandArgs, 5, 5);
+            terminate(() -> TideClient.connect(args[0], port), commandArgs, output);
             return;
         }
         try (TideClient client = TideClient.connect(args[0], port)) {
@@ -185,6 +192,47 @@ public final class ClientMain {
 
     private static int route(String value) {
         return value.equals("-") ? Ingress.ROUTE_BY_KEY : Integer.parseInt(value);
+    }
+
+    private static void terminate(TideClient.Connector connector, String[] args, PrintStream out)
+            throws IOException {
+        var targets = new java.util.TreeSet<Long>();
+        for (String value : args[4].split(",", -1)) {
+            long offset = nonnegative(value, "offset");
+            if (!targets.add(offset)) {
+                throw new IllegalArgumentException("duplicate offset " + offset);
+            }
+        }
+        int partition = bounded(args[3], 0, 63, "partition");
+        var wanted = new TopicPartition(args[2], partition);
+        try (TideClient client = connector.open()) {
+            var epoch = client.join(args[0], args[1], Set.of(args[2]));
+            var matched = new java.util.ArrayList<TideClient.Received>(targets.size());
+            var remaining = new java.util.TreeSet<Long>(targets);
+            while (!remaining.isEmpty()) {
+                var batch = client.pull(epoch.number(), Math.min(remaining.size(), client.maxBatch()));
+                if (batch.isEmpty()) {
+                    throw new IOException("no accepted delivery available for offsets " + remaining);
+                }
+                for (var received : batch) {
+                    var message = received.lease().message();
+                    if (remaining.remove(message.offset()) && message.partition().equals(wanted)) {
+                        matched.add(received);
+                    }
+                }
+            }
+            if (matched.size() != targets.size()) {
+                throw new IOException("offset(s) not present on partition " + wanted);
+            }
+            var refs = matched.stream().map(TideClient.Received::lease)
+                    .map(tidemq.delivery.DeliveryLease::ref).toList();
+            var frontiers = client.terminate(epoch.number(), refs);
+            for (var received : matched) {
+                out.printf("terminated group=%s member=%s ", args[0], args[1]);
+                printMessage(out, received.lease().message());
+            }
+            frontiers.forEach((part, next) -> out.printf("frontier partition=%s next=%d%n", part, next));
+        }
     }
 
     private static void consume(GroupConsumer consumer, String group, String member,

@@ -168,6 +168,11 @@ public final class TideClient implements AutoCloseable {
                 WireValues.writeSettlement(output, new WireValues.Settlement(epoch, refs)), WireValues::readFrontiers);
     }
 
+    public Map<TopicPartition, Long> terminate(long epoch, List<DeliveryLease.Ref> refs) throws IOException {
+        return request(Opcode.TERMINATE, output ->
+                WireValues.writeSettlement(output, new WireValues.Settlement(epoch, refs)), WireValues::readFrontiers);
+    }
+
     public void leave() throws IOException {
         request(Opcode.LEAVE, EMPTY, input -> null);
     }

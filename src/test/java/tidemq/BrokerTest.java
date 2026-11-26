@@ -44,6 +44,14 @@ public final class BrokerTest {
                 new Case("frame-budget-does-not-create-lease", BrokerTest::smallFrame),
                 new Case("accept-is-idempotent-with-fixed-deadline", BrokerTest::idempotentAccept),
                 new Case("lease-timeout-retries-and-terminal-delivery", BrokerTest::retry),
+                new Case("consumer-terminates-accepted-delivery", BrokerTest::terminateDelivery),
+                new Case("terminate-closes-only-its-own-hole", BrokerTest::terminateHole),
+                new Case("terminate-requires-accepted-current-lease", BrokerTest::terminateGuards),
+                new Case("terminate-before-deadletter-force-reconciled",
+                        () -> recoverTerminate(Boundary.Point.DEADLETTER_BEFORE_FORCE)),
+                new Case("terminate-before-group-snapshot-reconciled",
+                        () -> recoverTerminate(Boundary.Point.DEADLETTER_AFTER_FORCE)),
+                new Case("duplicate-terminate-rejected", BrokerTest::duplicateTerminate),
                 new Case("dead-letter-before-force-reconciled", () -> recoverDeadLetter(Boundary.Point.DEADLETTER_BEFORE_FORCE)),
                 new Case("dead-letter-force-before-frontier-reconciled", () -> recoverDeadLetter(Boundary.Point.DEADLETTER_AFTER_FORCE)),
                 new Case("group-before-replace-preserves-prior-epoch", BrokerTest::abortEpoch),
@@ -349,8 +357,139 @@ public final class BrokerTest {
         }
     }
 
-    private static void abortEpoch() throws Exception {
+    private static void terminateDelivery() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root), new Time(), Boundary.NONE);
+             var client = connect(server)) {
+            seed(client, 2, bytes("poison"));
+            long epoch = client.join("g", "m", ORDERS).number();
+            var batch = client.pull(epoch, 2);
+            eq(List.of(0L, 1L), offsets(batch));
+            var poison = batch.getFirst();
+            var frontiers = client.terminate(epoch, List.of(poison.lease().ref()));
+            long next = frontiers.get(P0);
+            eq(1L, next);
+            var page = client.deadLetters("g", 0, 8);
+            eq(1, page.receipts().size());
+            var receipt = page.receipts().getFirst();
+            eq(0L, receipt.sequence());
+            eq(1, receipt.attempts());
+            eq(poison.lease().message(), receipt.message());
+            eq(P0, receipt.message().partition());
+            eq(0L, receipt.message().offset());
+            var view = client.group("g").frontiers().get(P0);
+            eq(1L, view.next());
+            eq(0, view.ahead());
+            eq(1, view.retrying());
+            // The terminated lease is released and never redelivered; the remaining offset ACKs
+            // through its existing lease and advances the continuous watermark to the end.
+            eq(2L, ack(client, epoch, batch.subList(1, 2)).get(P0));
+            eq(List.of(), client.pull(epoch, 4));
+        }
+    }
+
+    private static void terminateHole() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root), new Time(), Boundary.NONE);
+             var client = connect(server)) {
+            seed(client, 3, bytes("work"));
+            long epoch = client.join("g", "m", ORDERS).number();
+            var batch = client.pull(epoch, 3);
+            // Terminate the highest offset: it closes only its own hole, the watermark stays.
+            var high = List.of(batch.get(2).lease().ref());
+            long holeNext = client.terminate(epoch, high).get(P0);
+            eq(0L, holeNext);
+            eq(1, client.deadLetters("g", 0, 8).receipts().size());
+            var afterHole = client.group("g").frontiers().get(P0);
+            eq(0L, afterHole.next());
+            eq(1, afterHole.ahead());
+            eq(2, afterHole.retrying());
+            // ACK the lowest offset: the continuous prefix reaches the hole at offset 1.
+            long firstAck = ack(client, epoch, batch.subList(0, 1)).get(P0);
+            eq(1L, firstAck);
+            // Filling the last hole advances the watermark past every resolved offset.
+            long secondAck = ack(client, epoch, batch.subList(1, 2)).get(P0);
+            eq(3L, secondAck);
+            eq(3L, client.group("g").frontiers().get(P0).next());
+            eq(List.of(), client.pull(epoch, 4));
+        }
+    }
+
+    private static void terminateGuards() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root), new Time(), Boundary.NONE);
+             var first = connect(server);
+             var replacement = connect(server)) {
+            publish(first, "p", 0, bytes("guarded"));
+            long epoch = first.join("g", "m", ORDERS).number();
+            // A reservation that was never accepted cannot be terminated.
+            var reserved = first.reserve(epoch, 1);
+            eq(1, reserved.size());
+            code(UNKNOWN_LEASE, () -> first.terminate(epoch, List.of(reserved.getFirst().ref())));
+            // Accepting the same delivery turns the reservation into an owned lease.
+            var accepted = first.accept(epoch, List.of(reserved.getFirst().ref()));
+            eq(1, accepted.size());
+            // A membership change advances the generation; the old connection is fenced off.
+            long fenced = replacement.join("g", "m", ORDERS).number();
+            check(fenced > epoch, "reconnect must advance the generation");
+            code(STALE_EPOCH, () -> first.terminate(epoch, List.of(reserved.getFirst().ref())));
+            // The new generation redelivers the lost lease; only current accepted leases terminate.
+            var redelivery = replacement.pull(fenced, 1);
+            eq(1, redelivery.size());
+            var bogus = new DeliveryLease.Ref(999_999L, P0, 0L);
+            code(UNKNOWN_LEASE, () -> replacement.terminate(fenced, List.of(bogus)));
+            var frontiers = replacement.terminate(fenced, List.of(redelivery.getFirst().lease().ref()));
+            long next = frontiers.get(P0);
+            eq(1L, next);
+            // Repeating the same termination finds no active lease.
+            code(UNKNOWN_LEASE, () -> replacement.terminate(fenced,
+                    List.of(redelivery.getFirst().lease().ref())));
+        }
+    }
+
+    private static void recoverTerminate(Boundary.Point point) throws Exception {
         try (var tmp = new Scratch()) {
+            var fault = new Fault();
+            var time = new Time();
+            var config = settings(tmp.root);
+            try (var server = TcpBroker.start(config, time, fault); var client = connect(server)) {
+                seed(client, 2, bytes("fatal"));
+                long epoch = client.join("g", "m", ORDERS).number();
+                var batch = client.pull(epoch, 2);
+                fault.arm(point);
+                code(STORAGE_FAILURE,
+                        () -> client.terminate(epoch, List.of(batch.getFirst().lease().ref())));
+            }
+            try (var server = TcpBroker.start(config, time, Boundary.NONE); var client = connect(server)) {
+                long epoch = client.join("g", "m", ORDERS).number();
+                // The source-bearing dead letter is queryable before any watermark movement.
+                var page = client.deadLetters("g", 0, 8);
+                eq(1, page.receipts().size());
+                eq(0L, page.receipts().getFirst().message().offset());
+                eq(P0, page.receipts().getFirst().message().partition());
+                // Recovery closed the terminated hole; the remaining offset is still deliverable.
+                var redelivery = client.pull(epoch, 4);
+                eq(List.of(1L), offsets(redelivery));
+                eq(2L, ack(client, epoch, redelivery).get(P0));
+                eq(List.of(), client.pull(epoch, 4));
+            }
+        }
+    }
+
+    private static void duplicateTerminate() throws Exception {
+        try (var tmp = new Scratch();
+             var server = TcpBroker.start(settings(tmp.root), new Time(), Boundary.NONE);
+             var client = connect(server)) {
+            seed(client, 1, bytes("once"));
+            long epoch = client.join("g", "m", ORDERS).number();
+            var ref = client.pull(epoch, 1).getFirst().lease().ref();
+            eq(1, client.terminate(epoch, List.of(ref)).size());
+            code(UNKNOWN_LEASE, () -> client.terminate(epoch, List.of(ref)));
+            eq(1, client.deadLetters("g", 0, 8).receipts().size());
+        }
+    }
+
+    private static void abortEpoch() throws Exception {        try (var tmp = new Scratch()) {
             var fault = new Fault();
             var time = new Time();
             var config = settings(tmp.root);

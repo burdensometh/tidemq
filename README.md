@@ -19,6 +19,7 @@ client=(java -cp build/tidemq.jar tidemq.ClientMain 127.0.0.1 7410)
 "${client[@]}" produce checkout 0 orders - order-7 created
 "${client[@]}" produce checkout 0 orders - order-7 created
 "${client[@]}" consume warehouse reader-1 orders 1
+"${client[@]}" terminate warehouse reader-1 orders 0 12
 "${client[@]}" group warehouse
 "${client[@]}" flow warehouse
 "${client[@]}" partition orders 0
@@ -35,6 +36,7 @@ Java 客户端提供 `TideClient` 的底层操作，也提供 `ResumableProducer
 - 顺序属于分区。首次消费从当前最早保留偏移开始。重复投递、乱序确认与并发分区都可以出现。业务处理应按分区及偏移幂等。
 - 组的订阅在第一次成功 JOIN 时固定。现存成员名字按字典序排序，订阅分区按话题及分区号排序，再轮转分配。加入、退出和同名重连推进持久成员代，旧代的租约失效。成员可用 `ASSIGN` 更新在当前会话的分配。
 - 拉取先预留。标准客户端完整读取并解码 PULL 成功帧，再发送 `ACCEPT`，此时才增加持久尝试次数。发送成功前断线产生的预留可直接释放。已接受的租约在超时、离开代或断线时可重新投递。最后一次已接受租约失效后，代理先持久化死信，再推进组水位。
+- 消费者可用 `TERMINATE` 把当前代、当前会话中已接受的投递立即标记为无法处理并归档到该组死信日志，无需等满重试上限；未接受的预留或跨代租约被拒绝。终止先持久化带来源分区和偏移的死信，再在组快照中关闭该偏移。高偏移终止只关自己的洞，较低消息由正常 ACK 补齐后连续水位才推进。任一写入边界中断都可在重启时按死信回执恢复，运维经 `deadletters` 查询归档。
 - ACK 只能结算当前代、当前成员会话中已接受的租约。一批 ACK 在一次组快照内更新。水位是下一个未完成偏移，晚到 ACK 和终态死信只能关闭各自的洞。ACK 回复丢失时可观察组水位，并容忍重复读取。
 - 仅回收连续的已封口前缀段。段右端必须不大于所有订阅组的最小连续水位，且达到配置的最短保留年龄。离线组仍参与。无订阅组时使用分区结束偏移。回收永远保留活跃段，并保留独立存储的生产和死信回执。
 - `delivery.max.batch` 限制每条批操作的记录数。`delivery.max.inflight` 限制每成员的同时预留及已接受租约总数。`delivery.window` 限制水位之后每分区可探测的偏移范围。帧预算会进一步限制 PULL 或死信查询返回行数。

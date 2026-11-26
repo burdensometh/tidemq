@@ -146,6 +146,38 @@ public final class GroupConsumer implements AutoCloseable {
         }
     }
 
+    /**
+     * Archives accepted deliveries the consumer cannot process as dead letters and closes
+     * their group offsets. Only deliveries from this consumer's active batch are eligible;
+     * the broker additionally requires an accepted lease in the current member generation.
+     */
+    public Map<TopicPartition, Long> terminate(Batch batch, List<TideClient.Received> poison)
+            throws IOException {
+        if (batch.owner != this || !batch.messages().containsAll(poison)) {
+            throw new IllegalArgumentException("deliveries do not belong to this consumer batch");
+        }
+        operation.lock();
+        try {
+            if (closed || client == null || batch.incarnation != incarnation || batch.epoch() != assignment.number()) {
+                throw new BrokerException(BrokerException.Code.STALE_EPOCH,
+                        "batch belongs to an earlier connection or epoch");
+            }
+            if (poison.isEmpty()) {
+                return Map.of();
+            }
+            List<DeliveryLease.Ref> refs = poison.stream().map(TideClient.Received::lease)
+                    .map(DeliveryLease::ref).toList();
+            return client.terminate(batch.epoch(), refs);
+        } catch (BrokerException rejected) {
+            throw rejected;
+        } catch (IOException transport) {
+            drop(transport);
+            throw new IOException("termination result unknown for " + group + "/" + member, transport);
+        } finally {
+            operation.unlock();
+        }
+    }
+
     private void ensureJoined() throws IOException {
         if (closed) {
             throw new IOException("consumer is closed");

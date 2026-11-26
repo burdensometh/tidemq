@@ -43,7 +43,10 @@ public final class DeliveryEngine {
                 throw new IOException("dead-letter source outside group partition");
             }
             if (!frontier.isComplete(message.offset())) {
-                if (frontier.attempts(message.offset()) != receipt.attempts()) {
+                int attempts = frontier.attempts(message.offset());
+                // A consumer-initiated termination is durable in the dead-letter journal while the
+                // group snapshot that removes its attempt counter may still be missing.
+                if (attempts != 0 && attempts != receipt.attempts()) {
                     throw new IOException("dead-letter attempts disagree with group checkpoint");
                 }
                 frontier.complete(message.offset());
@@ -252,6 +255,37 @@ public final class DeliveryEngine {
             book.remove(entry);
         }
         groups.saveProgress(group);
+        return frontiers(group, touched);
+    }
+
+    public Map<TopicPartition, Long> terminate(GroupEpoch epoch, long session, List<DeliveryLease.Ref> refs, long now)
+            throws IOException {
+        GroupState group = groups.require(epoch.group());
+        LeaseBook book = requireBook(epoch);
+        expire(group, book, now);
+        List<LeaseBook.Entry> entries = resolve(book, epoch, session, refs);
+        // Validate every lease before any durable write, so a rejected batch never archives
+        // a partial set of dead letters.
+        for (LeaseBook.Entry entry : entries) {
+            if (!entry.accepted()) {
+                throw new BrokerException(BrokerException.Code.UNKNOWN_LEASE,
+                        "accept delivery before terminating it");
+            }
+        }
+        var touched = new java.util.TreeSet<TopicPartition>();
+        for (LeaseBook.Entry entry : entries) {
+            var ref = entry.ref();
+            // Persist the dead letter before closing the group offset, so a crash at either
+            // write boundary leaves a source-bearing receipt that recovery can reconcile.
+            terminal(group, ref.partition(), ref.offset(), now);
+            touched.add(ref.partition());
+            book.remove(entry);
+        }
+        groups.saveProgress(group);
+        return frontiers(group, touched);
+    }
+
+    private Map<TopicPartition, Long> frontiers(GroupState group, java.util.Set<TopicPartition> touched) {
         var result = new java.util.TreeMap<TopicPartition, Long>();
         touched.forEach(partition -> result.put(partition, group.frontier(partition).next()));
         return result;

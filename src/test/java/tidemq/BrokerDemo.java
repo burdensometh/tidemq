@@ -66,16 +66,23 @@ public final class BrokerDemo {
         var batchA = a.pull(current.number(), 16);
         List<TideClient.Received> process = new ArrayList<>();
         TideClient.Received poison = null;
+        TideClient.Received fatal = null;
         for (var delivery : batchA) {
             var message = delivery.lease().message();
             printDelivery("work", "a", delivery);
             if (message.partition().equals(FIRST) && message.offset() == 0) {
                 poison = delivery;
+            } else if (message.partition().equals(FIRST) && message.offset() == 2) {
+                fatal = delivery;
             } else {
                 process.add(delivery);
             }
         }
-        check(poison != null, "poison message missing");
+        check(poison != null && fatal != null, "poison messages missing");
+        // The consumer explicitly archives an unprocessable accepted delivery as a dead letter.
+        var terminated = a.terminate(current.number(), List.of(fatal.lease().ref()));
+        eq(0L, terminated.get(FIRST));
+        System.out.printf("terminated partition=%s offset=2 work_next=%d%n", FIRST, terminated.get(FIRST));
         var frontiers = BrokerTest.ack(a, current.number(), process);
         eq(0L, frontiers.get(FIRST));
         System.out.printf("out-of-order group=work partition=%s next=%d%n", FIRST, frontiers.get(FIRST));
@@ -90,10 +97,12 @@ public final class BrokerDemo {
         waitFor(retry.getFirst().expiresAtMs());
         eq(List.of(), a.pull(current.number(), 16));
         var dead = a.deadLetters("work", 0, 16).receipts();
-        eq(1, dead.size());
-        System.out.printf("terminal group=work partition=%s offset=%d attempts=%d work_next=%d%n",
-                dead.getFirst().message().partition(), dead.getFirst().message().offset(), dead.getFirst().attempts(),
-                a.group("work").frontiers().get(FIRST).next());
+        eq(2, dead.size());
+        for (var letter : dead) {
+            System.out.printf("terminal group=work partition=%s offset=%d attempts=%d work_next=%d%n",
+                    letter.message().partition(), letter.message().offset(), letter.attempts(),
+                    a.group("work").frontiers().get(FIRST).next());
+        }
 
         eq(0, a.retire());
         System.out.printf("retention blocked audit_next=%d p0_segments=%d%n",

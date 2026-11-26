@@ -122,6 +122,11 @@ public final class Broker implements AutoCloseable {
         return run(() -> delivery.ack(checkEpoch(member, epoch), member.session(), refs, now()));
     }
 
+    public Map<TopicPartition, Long> terminate(Member member, long epoch, List<DeliveryLease.Ref> refs)
+            throws IOException {
+        return run(() -> delivery.terminate(checkEpoch(member, epoch), member.session(), refs, now()));
+    }
+
     private GroupEpoch checkEpoch(Member member, long epoch) throws BrokerException {
         return groups.requireEpoch(member.group(), member.name(), member.session(), epoch);
     }
